@@ -37,7 +37,7 @@ class TempState(NoNetwork):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         names = ("STATE_DIR", "STATE", "CACHE_DIR", "CONV_CACHE", "CHATINFO_CACHE",
-                 "PROFILES_CACHE", "MESSAGES_DIR", "TEAMS_CACHE")
+                 "PROFILES_CACHE", "MESSAGES_DIR", "CSA_CACHE")
         self._old = {n: getattr(tc, n) for n in names}
         d = self.tmp.name
         tc.STATE_DIR = os.path.join(d, "config")
@@ -47,7 +47,7 @@ class TempState(NoNetwork):
         tc.CHATINFO_CACHE = os.path.join(tc.CACHE_DIR, "chatinfo.json")
         tc.PROFILES_CACHE = os.path.join(tc.CACHE_DIR, "profiles.json")
         tc.MESSAGES_DIR = os.path.join(tc.CACHE_DIR, "messages")
-        tc.TEAMS_CACHE = os.path.join(tc.CACHE_DIR, "teams.json")
+        tc.CSA_CACHE = os.path.join(tc.CACHE_DIR, "csa.json")
         self._keyring = (tc.keyring_get, tc.keyring_put, tc.keyring_clear)
         tc.keyring_get = lambda name: None
         tc.keyring_put = lambda name, value: True
@@ -56,7 +56,7 @@ class TempState(NoNetwork):
         tc._warned = False
         for name in ("iter_conversations", "iter_msgs", "chat_get", "chat_call", "my_oid", "chatinfo",
                      "mt_call", "resolve", "resolve_write", "people", "self_name", "ams_headers",
-                     "resource_token", "csa_get", "all_conversations"):
+                     "resource_token", "csa_get", "all_conversations", "profiles"):
             self.addCleanup(setattr, tc, name, getattr(tc, name))
 
     def tearDown(self):

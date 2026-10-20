@@ -61,8 +61,9 @@ A GUI can pass `--url -` and write the URL to stdin instead. The one-time code i
 - Without a keyring they stay in `~/.config/teams-cli/state.json` (file 0600, directory 0700) and a warning is printed.
 - The same file holds non-secret state that must survive restarts: the Trouter `endpoint` id (a new one hits "Endpoint limit exceeded"), region, chat host and token expiry times.
 - The cache lives in `~/.cache/teams-cli/` (0700). It is plain JSON, readable only by your user (files 0600). JSON is enough at this size (3.4 MB parses in ~30 ms); a database would only pay off if full message history were cached.
-  - `conversations.json` — the full conversation list (1217 conversations, ~3.4 MB). Refetched after 15 min (`chats --all`) or with `--refresh`; `teams` reads it only as a fallback.
-  - `teams.json` — the teams -> channels tree from the chat service aggregator (one request, ~5 s), cached for 15 min.
+  - `csa.json` — teams, channels and chats from the chat service aggregator (one request, ~5 s, ~2.3 MB), trimmed to
+    what `teams` and `chats --all` show. Refetched after 15 min or with `--refresh`.
+  - `conversations.json` — the full conversation list (1217 conversations, ~3.4 MB), only used when the aggregator fails.
   - `chatinfo.json` — chat ids for list numbers, chat titles and peer names.
   - `messages/<hash>.json` — the last 50 messages per chat, used only as an offline fallback for `read` (and as the first paint for a GUI). `watch` keeps it current.
   - `profiles.json` — directory display names, cached for 7 days.
@@ -95,8 +96,9 @@ itself and in chats). `search` results have `id, chat_id, thread_id, chat, from,
 is how Teams numbers messages). In `--json` mode errors are `{"error": "..."}` on stdout with exit code 1.
 
 `chats` rows carry an exact `unread` count (capped, see `unread_capped`). `chats --all` rows have no `n`/number and
-`unread` is `true` (something newer than the read marker), `false`, or `null` when the list payload has no read
-marker for that conversation — no per-chat requests are made there. `teams --json` is
+`unread` is `true` (the server's read flag), `false`, or `null` when the server has no flag for that conversation — no
+per-chat requests are made there. Untitled chats are named like the client: the 1:1 peer, or the first three members of
+a group (`Ann, Ben, Cid +2`); names come from the directory (cached for 7 days). `teams --json` is
 `[{id, name, favorite, archived, members, channels: [{id, name, kind, unread, pinned, muted}]}]` with `kind` =
 `general`, `channel` or `private`. Channels follow the client's order: General, pinned, then by name; channels you have
 not joined are left out. If the aggregator fails, the tree is built from the conversation list without the flags.

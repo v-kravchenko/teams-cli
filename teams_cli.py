@@ -29,7 +29,7 @@ CONV_CACHE = os.path.join(CACHE_DIR, "conversations.json")
 CHATINFO_CACHE = os.path.join(CACHE_DIR, "chatinfo.json")
 PROFILES_CACHE = os.path.join(CACHE_DIR, "profiles.json")
 MESSAGES_DIR = os.path.join(CACHE_DIR, "messages")
-TEAMS_CACHE = os.path.join(CACHE_DIR, "teams.json")
+CSA_CACHE = os.path.join(CACHE_DIR, "csa.json")
 CACHE_VERSION = 1
 DEBUG = False
 
@@ -624,12 +624,38 @@ def list_chats():
 
 
 def list_all_chats(refresh=False):
-    """Every conversation (chats, channels of all teams) from the cached full list; `unread` is a boolean."""
-    convs = all_conversations(900, refresh,
-                              progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr))
+    """Every conversation (chats, channels of all teams); `unread` is a boolean. Aggregator first, full list as a fallback."""
     names = chatinfo()["names"]
     me = my_oid()
-    return [chat_row(c, names, me, fetch_names=False) for c in convs]
+    try:
+        d = csa_data(refresh)
+    except TeamsError as e:
+        print(f"warning: aggregator failed ({e}); using the conversation list", file=sys.stderr)
+        convs = all_conversations(900, refresh,
+                                  progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr))
+        return [chat_row(c, names, me, fetch_names=False) for c in convs]
+    me_mri = "8:orgid:" + me
+    try:
+        prof = profiles([m for c in d["chats"] if not c.get("title") for m in csa_others(c, me_mri)])
+    except TeamsError:
+        prof = {}
+    rows = []
+    for c in d["chats"]:
+        unread = False if c.get("isLastMessageFromMe") else None if c.get("isRead") is None else not c["isRead"]
+        row = chat_row(_csa_conv(c), names, me, unread=unread, fetch_names=False)
+        row["title"] = csa_title(c, names, me_mri, prof)
+        rows.append(row)
+    for t in d["teams"]:
+        for ch in t.get("channels") or []:
+            if ch.get("isDeleted"):  # unlike the tree, keeps channels with isMember false: the full list had them
+                continue
+            unread = None if ch.get("isMessageRead") is None else not ch["isMessageRead"]
+            rows.append(chat_row(_csa_conv(ch, channel=True), names, me, unread=unread, fetch_names=False))
+    try:  # the aggregator leaves out the self chat
+        rows.append(chat_row(chat_get("/v1/users/ME/conversations/48:notes"), names, me, fetch_names=False))
+    except TeamsError:
+        pass
+    return sorted(rows, key=lambda r: r["time"] or "", reverse=True)
 
 
 def channel_tree(convs):
@@ -659,6 +685,75 @@ def csa_get(path):
     return http("GET", "https://teams.microsoft.com/api/csa/api/v1/teams/users/me" + path, hdr)[1]
 
 
+_CSA_TEAM_KEYS = ("id", "displayName", "isDeleted", "isFavorite", "isArchived", "membershipSummary",
+                  "teamSiteInformation")
+_CSA_CHANNEL_KEYS = ("id", "displayName", "isGeneral", "channelType", "isMember", "isDeleted", "isMessageRead",
+                     "isMuted", "lastMessage", "consumptionHorizon")
+_CSA_CHAT_KEYS = ("id", "title", "isOneOnOne", "chatType", "isRead", "isLastMessageFromMe", "lastMessage",
+                  "consumptionHorizon")
+
+
+def _pick(d, keys):
+    return {k: d[k] for k in keys if k in d}
+
+
+def csa_data(refresh=False):
+    """Teams, channels and chats from the aggregator, trimmed and cached for 15 min; TeamsError when it fails."""
+    cache = _read_cache(CSA_CACHE)
+    if cache and not refresh and time.time() - cache.get("fetched_at", 0) < 900:
+        return cache
+    d = csa_get("?isPrefetch=false&enableMembershipSummary=true")
+    try:
+        pinned = csa_get("/pinnedChannels").get("pinChannelOrder") or []
+    except TeamsError:
+        pinned = []
+    teams = [{**_pick(t, _CSA_TEAM_KEYS), "channels": [_pick(c, _CSA_CHANNEL_KEYS) for c in t.get("channels") or []]}
+             for t in d.get("teams") or []]
+    chats = [{**_pick(c, _CSA_CHAT_KEYS), "members": [m.get("mri") for m in (c.get("members") or [])[:10]],
+              "member_count": len(c.get("members") or [])} for c in d.get("chats") or []]
+    data = {"fetched_at": time.time(), "teams": teams, "chats": chats, "pinned": pinned}
+    _write_cache(CSA_CACHE, data)
+    return data
+
+
+def _csa_conv(c, channel=False):
+    """An aggregator chat or channel in the conversation-list shape, so chat_row can render it."""
+    m = c.get("lastMessage") or {}
+    last = {"id": m.get("id"), "content": m.get("content"), "messagetype": m.get("messageType"),
+            "imdisplayname": m.get("imDisplayName"), "composetime": m.get("composeTime"), "from": m.get("from")}
+    h = c.get("consumptionHorizon") or {}
+    hz = ";".join(str(h.get(k) or 0) for k in ("originalArrivalTime", "timeStamp", "clientMessageId")) if h else ""
+    tp = {"topic": c.get("displayName"), "threadType": "space"} if channel else {}
+    return {"id": c["id"], "lastMessage": last if m else {}, "properties": {"consumptionhorizon": hz},
+            "threadProperties": tp}
+
+
+def csa_others(c, me_mri):
+    """Member mris except me; a 1:1 whose peer left the roster still names the peer in its id."""
+    others = [m for m in c.get("members") or [] if m != me_mri]
+    if c.get("isOneOnOne") and not others and c["id"].endswith("@unq.gbl.spaces"):
+        oids = c["id"].split(":", 1)[-1].split("@")[0].split("_")
+        others = ["8:orgid:" + o for o in oids if o != me_mri.split(":")[-1]][:1]
+    return others
+
+
+def csa_title(c, names, me_mri, prof):
+    """Chat title like the client: the topic, the peer of a 1:1, or the first members of an untitled group."""
+    if c.get("title"):
+        return c["title"]
+    others = csa_others(c, me_mri)
+    if c.get("isOneOnOne"):
+        last = c.get("lastMessage") or {}
+        peer = last.get("imDisplayName") if me_mri not in (last.get("from") or "") else None  # bots, departed users
+        nm = names.get(c["id"]) or (prof.get(others[0]) if others else None) or peer
+        return f"[1:1] {nm}" if nm else "[chat]"
+    nms = [prof[m] for m in others if prof.get(m)][:3]
+    if not nms:
+        return "[chat]"
+    more = (c.get("member_count") or len(others) + 1) - 1 - len(nms)
+    return ", ".join(nms) + (f" +{more}" if more > 0 else "")
+
+
 def csa_tree(d, pinned=()):
     """Teams -> channels from the aggregator: real team names, pinned order, unread/muted/archived flags."""
     order = {cid: i for i, cid in enumerate(pinned)}
@@ -684,22 +779,13 @@ def csa_tree(d, pinned=()):
 
 def teams_tree(refresh=False):
     """The tree from the aggregator (cached 15 min); falls back to the full conversation list."""
-    cache = _read_cache(TEAMS_CACHE)
-    if cache and not refresh and time.time() - cache.get("fetched_at", 0) < 900:
-        return cache.get("teams") or []
     try:
-        d = csa_get("?isPrefetch=false&enableMembershipSummary=true")
-        try:
-            pinned = csa_get("/pinnedChannels").get("pinChannelOrder") or []
-        except TeamsError:
-            pinned = []
+        d = csa_data(refresh)
     except TeamsError as e:
         print(f"warning: aggregator failed ({e}); building the tree from the conversation list", file=sys.stderr)
         return channel_tree(all_conversations(86400, refresh,
                                               progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr)))
-    tree = csa_tree(d, pinned)
-    _write_cache(TEAMS_CACHE, {"fetched_at": time.time(), "teams": tree})
-    return tree
+    return csa_tree(d, d.get("pinned") or [])
 
 
 def cmd_teams(a):

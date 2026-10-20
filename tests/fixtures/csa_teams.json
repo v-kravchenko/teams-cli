@@ -1,30 +1,240 @@
 {
  "teams": [
-  {"id": "19:gen-b@thread.tacv2", "displayName": "beta team", "isFavorite": false, "isArchived": false,
-   "membershipSummary": {"totalMemberCount": 4}, "teamSiteInformation": {"groupId": "g-b"},
+  {
+   "id": "19:gen-b@thread.tacv2",
+   "displayName": "beta team",
+   "isFavorite": false,
+   "isArchived": false,
+   "membershipSummary": {
+    "totalMemberCount": 4
+   },
+   "teamSiteInformation": {
+    "groupId": "g-b"
+   },
    "channels": [
-    {"id": "19:gen-b@thread.tacv2", "displayName": "General", "isGeneral": true, "channelType": 0, "isMember": true,
-     "isMessageRead": true}
-   ]},
-  {"id": "19:gen-z@thread.tacv2", "displayName": "Zeta (old)", "isArchived": true,
-   "teamSiteInformation": {"groupId": "g-z"},
-   "channels": [{"id": "19:gen-z@thread.tacv2", "displayName": "General", "isGeneral": true, "channelType": 0}]},
-  {"id": "19:gen-a@thread.tacv2", "displayName": "Alpha", "isFavorite": true, "isArchived": false,
-   "membershipSummary": {"totalMemberCount": 95}, "teamSiteInformation": {"groupId": "g-a"},
+    {
+     "id": "19:gen-b@thread.tacv2",
+     "displayName": "General",
+     "isGeneral": true,
+     "channelType": 0,
+     "isMember": true,
+     "isMessageRead": true
+    }
+   ]
+  },
+  {
+   "id": "19:gen-z@thread.tacv2",
+   "displayName": "Zeta (old)",
+   "isArchived": true,
+   "teamSiteInformation": {
+    "groupId": "g-z"
+   },
    "channels": [
-    {"id": "19:zz@thread.tacv2", "displayName": "Zebra", "isGeneral": false, "channelType": 0, "isMember": true,
-     "isMessageRead": true, "isPinned": true},
-    {"id": "19:news@thread.tacv2", "displayName": "news", "isGeneral": false, "channelType": 0, "isMember": true,
-     "isMessageRead": false, "isMuted": true},
-    {"id": "19:gen-a@thread.tacv2", "displayName": "General", "isGeneral": true, "channelType": 0, "isMember": true,
-     "isMessageRead": true},
-    {"id": "19:secret@thread.skype", "displayName": "Secret", "isGeneral": false, "channelType": 1, "isMember": true,
-     "isMessageRead": true},
-    {"id": "19:other@thread.skype", "displayName": "Not joined", "isGeneral": false, "channelType": 1, "isMember": false},
-    {"id": "19:gone@thread.tacv2", "displayName": "Gone", "isGeneral": false, "channelType": 0, "isMember": true,
-     "isDeleted": true}
-   ]},
-  {"id": "19:del@thread.tacv2", "displayName": "Deleted", "isDeleted": true, "channels": []}
+    {
+     "id": "19:gen-z@thread.tacv2",
+     "displayName": "General",
+     "isGeneral": true,
+     "channelType": 0
+    }
+   ]
+  },
+  {
+   "id": "19:gen-a@thread.tacv2",
+   "displayName": "Alpha",
+   "isFavorite": true,
+   "isArchived": false,
+   "membershipSummary": {
+    "totalMemberCount": 95
+   },
+   "teamSiteInformation": {
+    "groupId": "g-a"
+   },
+   "channels": [
+    {
+     "id": "19:zz@thread.tacv2",
+     "displayName": "Zebra",
+     "isGeneral": false,
+     "channelType": 0,
+     "isMember": true,
+     "isMessageRead": true,
+     "isPinned": true
+    },
+    {
+     "id": "19:news@thread.tacv2",
+     "displayName": "news",
+     "isGeneral": false,
+     "channelType": 0,
+     "isMember": true,
+     "isMessageRead": false,
+     "isMuted": true,
+     "lastMessage": {
+      "id": "1700000300000",
+      "composeTime": "2026-10-20T10:00:00.000Z",
+      "imDisplayName": "Bob",
+      "from": "8:orgid:bob",
+      "messageType": "RichText/Html",
+      "content": "<p>release today</p>"
+     },
+     "consumptionHorizon": {
+      "originalArrivalTime": 1700000100000,
+      "timeStamp": 1700000100001,
+      "clientMessageId": "1"
+     }
+    },
+    {
+     "id": "19:gen-a@thread.tacv2",
+     "displayName": "General",
+     "isGeneral": true,
+     "channelType": 0,
+     "isMember": true,
+     "isMessageRead": true
+    },
+    {
+     "id": "19:secret@thread.skype",
+     "displayName": "Secret",
+     "isGeneral": false,
+     "channelType": 1,
+     "isMember": true,
+     "isMessageRead": true
+    },
+    {
+     "id": "19:other@thread.skype",
+     "displayName": "Not joined",
+     "isGeneral": false,
+     "channelType": 1,
+     "isMember": false
+    },
+    {
+     "id": "19:gone@thread.tacv2",
+     "displayName": "Gone",
+     "isGeneral": false,
+     "channelType": 0,
+     "isMember": true,
+     "isDeleted": true
+    }
+   ]
+  },
+  {
+   "id": "19:del@thread.tacv2",
+   "displayName": "Deleted",
+   "isDeleted": true,
+   "channels": []
+  }
  ],
- "chats": [], "users": [], "privateFeeds": [], "metadata": {}
+ "chats": [
+  {
+   "id": "19:me_peer@unq.gbl.spaces",
+   "isOneOnOne": true,
+   "chatType": "chat",
+   "isRead": false,
+   "isLastMessageFromMe": false,
+   "members": [
+    {
+     "mri": "8:orgid:me"
+    },
+    {
+     "mri": "8:orgid:peer"
+    }
+   ],
+   "lastMessage": {
+    "id": "1700000500000",
+    "composeTime": "2026-10-20T12:00:00.000Z",
+    "imDisplayName": "Peer P",
+    "from": "8:orgid:peer",
+    "messageType": "Text",
+    "content": "hi"
+   },
+   "consumptionHorizon": {
+    "originalArrivalTime": 1700000400000,
+    "timeStamp": 1,
+    "clientMessageId": "2"
+   }
+  },
+  {
+   "id": "19:me_gone@unq.gbl.spaces",
+   "isOneOnOne": true,
+   "chatType": "chat",
+   "isRead": true,
+   "members": [
+    {
+     "mri": "8:orgid:me"
+    }
+   ],
+   "lastMessage": {
+    "id": "1700000050000",
+    "composeTime": "2026-10-01T09:00:00.000Z",
+    "imDisplayName": "Gone User",
+    "from": "8:orgid:gone",
+    "messageType": "Text",
+    "content": "bye"
+   }
+  },
+  {
+   "id": "19:group1@thread.v2",
+   "isOneOnOne": false,
+   "chatType": "chat",
+   "isRead": true,
+   "isLastMessageFromMe": true,
+   "members": [
+    {
+     "mri": "8:orgid:me"
+    },
+    {
+     "mri": "8:orgid:a"
+    },
+    {
+     "mri": "8:orgid:b"
+    },
+    {
+     "mri": "8:orgid:c"
+    },
+    {
+     "mri": "8:orgid:d"
+    },
+    {
+     "mri": "8:orgid:e"
+    }
+   ],
+   "lastMessage": {
+    "id": "1700000200000",
+    "composeTime": "2026-10-19T08:00:00.000Z",
+    "imDisplayName": "Me",
+    "from": "8:orgid:me",
+    "messageType": "Text",
+    "content": "ok"
+   }
+  },
+  {
+   "id": "19:meet@thread.v2",
+   "title": "Daily standup",
+   "isOneOnOne": false,
+   "chatType": "meeting",
+   "members": [
+    {
+     "mri": "8:orgid:me"
+    }
+   ],
+   "lastMessage": {
+    "id": "1700000100000",
+    "composeTime": "2026-10-18T08:00:00.000Z",
+    "imDisplayName": "Ann",
+    "from": "8:orgid:a",
+    "messageType": "Text",
+    "content": "<p>notes</p>"
+   }
+  },
+  {
+   "id": "19:noread@thread.v2",
+   "isOneOnOne": false,
+   "chatType": "chat",
+   "members": [
+    {
+     "mri": "8:orgid:me"
+    }
+   ]
+  }
+ ],
+ "users": [],
+ "privateFeeds": [],
+ "metadata": {}
 }
