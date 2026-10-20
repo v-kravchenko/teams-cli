@@ -9,11 +9,13 @@ change; using it may be against your organisation's policy.
 ## Requirements
 
 - Python 3.11+, standard library only
-- `watch` also needs `websockets` (`pip install --user websockets`) and must be run with `python3 -P`
-  (`-I` hides user site-packages)
+- `watch` also needs `websockets` (`pip install --user websockets`); it is found in user site-packages even under `python3 -I`
 - Optional: `secret-tool` (libsecret) for keyring storage
 
 ## Usage
+
+Install the `teams` command: `ln -s "$PWD/teams_cli.py" ~/.local/bin/teams` (the file is executable, no flags needed).
+Below `teams_cli.py` and `teams` are the same.
 
 ```
 teams_cli.py login                          # opens the browser; paste the final blank-page URL back

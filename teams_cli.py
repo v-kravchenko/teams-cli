@@ -724,7 +724,12 @@ async def watch_once(want, as_json, seen, horizons):
     try:
         import websockets
     except ImportError:
-        sys.exit("watch needs the websockets package: pip install --user websockets")
+        import site
+        site.addsitedir(site.getusersitepackages())  # `python3 -I` hides user site-packages
+        try:
+            import websockets
+        except ImportError:
+            sys.exit("watch needs the websockets package: pip install --user websockets")
     ws_url, cparams, surl = await asyncio.to_thread(trouter_urls)
     async with websockets.connect(ws_url, additional_headers={"X-Skypetoken": session()[0], "User-Agent": UA},
                                   max_size=2**24, ping_interval=None) as ws:
