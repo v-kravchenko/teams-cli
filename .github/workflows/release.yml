@@ -19,6 +19,9 @@ jobs:
       - run: |
           cp teams_cli.py teams
           chmod +x teams
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes teams
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '/^## \[/ {on = index($0, "## [" v "]") == 1; next} /^\[/ {on = 0} on' CHANGELOG.md > notes.md
+          if [ -s notes.md ]; then notes=(--notes-file notes.md); else notes=(--generate-notes); fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" "${notes[@]}" teams
         env:
           GH_TOKEN: ${{ github.token }}
