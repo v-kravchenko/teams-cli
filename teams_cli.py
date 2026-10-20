@@ -948,7 +948,7 @@ def cli_event(as_json):
     return on_event
 
 
-async def watch_once(want, on_event, horizons):
+async def watch_once(want, on_event, seen, horizons):
     try:
         import websockets
     except ImportError:
@@ -1034,7 +1034,7 @@ def cmd_watch(a):
     delay = 2
     while True:
         try:
-            asyncio.run(watch_once(want, on_event, horizons))
+            asyncio.run(watch_once(want, on_event, seen, horizons))
             delay = 2
             on_event(status("disconnected", retry_in=delay))
         except KeyboardInterrupt:
