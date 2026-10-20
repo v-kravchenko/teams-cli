@@ -453,7 +453,9 @@ def cmd_read(a):
 def cmd_send(a):
     cid = resolve(a.chat)
     title = load().get("titles", {}).get(cid, cid)
-    text = a.text
+    text = a.text or ""
+    if not text and not a.image:
+        sys.exit("nothing to send: give text and/or --image")
     if not a.yes:
         if a.json:
             print(json.dumps({"sent": False, "dry_run": True, "chat_id": cid, "text": text}, ensure_ascii=False))
@@ -469,6 +471,12 @@ def cmd_send(a):
         content = (f'<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="{q["id"]}">'
                    f'<strong itemprop="mri" itemid="{(q.get("from") or "").rsplit("/", 1)[-1]}">{html.escape(q.get("imdisplayname") or "")}</strong>'
                    f'<span itemprop="time" itemid="{q["id"]}"></span><p itemprop="preview">{preview}</p></blockquote><p>{content}</p>')
+    if a.image:
+        _, tag = upload_image(cid, a.image)
+        if a.reply_to:
+            content += f"<p>{tag}</p>"
+        else:
+            content = (f"<p>{content}</p>" if text else "") + f"<p>{tag}</p>"
     body = {"clientmessageid": str(int(time.time() * 1000)),
             "content": content,
             "messagetype": "RichText/Html", "contenttype": "text", "imdisplayname": self_name(cid)}
@@ -479,6 +487,55 @@ def cmd_send(a):
         print(json.dumps({"sent": True, "chat_id": cid, "id": str((r or {}).get("OriginalArrivalTime") or "") or None, "client_id": body["clientmessageid"], "text": text}, ensure_ascii=False))
         return
     print(f"sent to {title!r}", "" if DEBUG else "", (r or {}) if DEBUG else "")
+
+
+AMS = "https://eu-api.asm.skype.com"
+IMG_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def ams_headers(extra=None):
+    return {"Authorization": "skype_token " + session()[0], **(extra or {})}
+
+
+def upload_image(cid, path):
+    """Upload an image to AMS; returns (object id, image tag html)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in IMG_TYPES:
+        sys.exit(f"unsupported image type {ext!r}; supported: {', '.join(IMG_TYPES)}")
+    data = open(path, "rb").read()
+    _, obj = http("POST", AMS + "/v1/objects", ams_headers({"Content-Type": "application/json"}),
+                  json.dumps({"type": "pish/image", "permissions": {cid: ["read"]},
+                              "filename": os.path.basename(path)}).encode())
+    oid = obj["id"]
+    http("PUT", f"{AMS}/v1/objects/{oid}/content/imgpsh", ams_headers({"Content-Type": IMG_TYPES[ext]}), data)
+    tag = (f'<img src="{AMS}/v1/objects/{oid}/views/imgo" itemtype="http://schema.skype.com/AMSImage" '
+           f'itemscope="{ext[1:]}" alt="{html.escape(os.path.basename(path))}" id="x_{oid}" itemid="{oid}">')
+    return oid, tag
+
+
+def cmd_download(a):
+    cid = resolve(a.chat)
+    m = next((m for m in iter_msgs(cid, max_pages=10) if m.get("id") == a.id), None)
+    if not m:
+        sys.exit(f"message {a.id} not found in recent history of this chat")
+    os.makedirs(a.out, exist_ok=True)
+    saved = []
+    for i, att in enumerate(msg_json(m, cid)["attachments"]):
+        if att["kind"] == "image" and "asm.skype" in (att.get("url") or ""):
+            req = urllib.request.Request(att["url"], headers={"User-Agent": UA, **ams_headers()})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                body = r.read()
+                ext = {"image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}.get(r.headers.get("Content-Type"), ".jpg")
+            path = os.path.join(a.out, f"{a.id}_{i}{ext}")
+            open(path, "wb").write(body)
+            saved.append({"kind": "image", "path": path})
+        elif att["kind"] == "file":
+            saved.append({"kind": "file", "name": att.get("name"), "url": att.get("url"), "note": "SharePoint file: open the url in a browser (not downloadable via this API)"})
+    if a.json:
+        print(json.dumps(saved, ensure_ascii=False, indent=1))
+    else:
+        for x in saved:
+            print(x.get("path") or f"{x['name']}  {x['url']}")
 
 
 def self_name(cid):
@@ -769,13 +826,20 @@ def main():
     mb.add_argument("chat")
     mb.add_argument("--json", action="store_true")
     mb.set_defaults(fn=cmd_members)
+    dl = sub.add_parser("download", help="save image attachments of a message (files: prints the SharePoint url)")
+    dl.add_argument("chat")
+    dl.add_argument("id")
+    dl.add_argument("-o", "--out", default=".")
+    dl.add_argument("--json", action="store_true")
+    dl.set_defaults(fn=cmd_download)
     w = sub.add_parser("watch", help="live incoming messages via Trouter websocket")
     w.add_argument("chats", nargs="*", help="chat numbers/id fragments to follow (default: all)")
     w.add_argument("--json", action="store_true", help="one JSON object per line")
     w.set_defaults(fn=cmd_watch)
     sd = sub.add_parser("send")
     sd.add_argument("chat")
-    sd.add_argument("text")
+    sd.add_argument("text", nargs="?", default="")
+    sd.add_argument("--image", metavar="PATH", help="attach an image (png/jpg/gif/webp)")
     sd.add_argument("--mention", action="append", metavar="NAME",
                     help="part of a name seen in the chat; put @NAME in the text (repeatable)")
     sd.add_argument("--reply-to", metavar="ID", help="quote this message id")
