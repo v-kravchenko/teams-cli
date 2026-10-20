@@ -310,16 +310,40 @@ def chat_kind(c):
     return "1:1" if i.endswith("@unq.gbl.spaces") else "group"
 
 
+def horizon_of(c):
+    h = ((c.get("properties") or {}).get("consumptionhorizon") or "").split(";")[0]
+    return int(h) if h.isdigit() else 0
+
+
+def chat_state(c, me):
+    """Newest real message and unread count (capped at one page), for chats that need it."""
+    last = c.get("lastMessage") or {}
+    hz = horizon_of(c)
+    lid = int(last.get("id") or 0)
+    mine = me in (last.get("from") or "")
+    maybe_unread = hz and lid > hz and not mine
+    if last.get("content") and not maybe_unread:
+        return last, 0, False
+    page = sorted((m for m in msgs_of(c["id"], 30) if m.get("messagetype") in REAL_TYPES),
+                  key=lambda m: int(m["id"]), reverse=True)
+    newest = page[0] if page else last
+    unread = sum(1 for m in page if int(m["id"]) > hz and me not in (m.get("from") or "")) if hz else 0
+    return newest, unread, bool(page) and len(page) >= 30 and unread == len(page)
+
+
 def cmd_chats(a):
+    from concurrent.futures import ThreadPoolExecutor
     d = chat_get("/v1/users/ME/conversations?startTime=0&pageSize=50&view=msnp24Equivalent&targetType=" + TARGETS)
     convs = [c for c in d.get("conversations", []) if c["id"] not in ("48:notifications", "48:threads")]
     st = load()
     st["chats"] = [c["id"] for c in convs]
     names = st.setdefault("names", {})
+    me = my_oid()
+    with ThreadPoolExecutor(8) as ex:
+        states = list(ex.map(lambda c: chat_state(c, me), convs))
     rows = []
-    for i, c in enumerate(convs):
+    for i, (c, (last, unread, capped)) in enumerate(zip(convs, states)):
         tp = c.get("threadProperties") or {}
-        last = c.get("lastMessage") or {}
         topic = tp.get("topic") or tp.get("spaceThreadTopic")
         if c["id"] == "48:notes":
             title = "Notes (me)"
@@ -331,14 +355,36 @@ def cmd_chats(a):
         text = msg_text(last)
         preview = f"{last.get('imdisplayname') or '?'}: {text}" if text else f"{last.get('imdisplayname') or '?'}: <{last.get('messagetype', '?')}>"
         rows.append({"n": i, "id": c["id"], "kind": chat_kind(c), "title": title, "time": last.get("composetime"),
-                     "from": last.get("imdisplayname"), "preview": preview})
+                     "from": last.get("imdisplayname"), "preview": preview, "last_id": last.get("id"),
+                     "unread": unread, "unread_capped": capped, "read_up_to": str(horizon_of(c)) if horizon_of(c) else None})
         st.setdefault("titles", {})[c["id"]] = title
     save(st)
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
     for r in rows:
-        print(f"{r['n']:>3}  {ts(r['time']):19}  {r['title'][:42]:42}  {r['preview'][:60]!r}")
+        badge = f"({r['unread']}{'+' if r['unread_capped'] else ''})" if r["unread"] else ""
+        prev = r["preview"].replace("\n", " ")
+        print(f"{r['n']:>3}  {ts(r['time']):19}  {r['title'][:36]:36} {badge:>5}  {prev[:60]!r}")
+
+
+def cmd_members(a):
+    cid = resolve(a.chat)
+    d = chat_get(f"/v1/threads/{urllib.parse.quote(cid, safe='')}?view=msnp24Equivalent")
+    seen = {}
+    for m in msgs_of(cid, 100):
+        if m.get("imdisplayname"):
+            seen.setdefault((m.get("from") or "").rsplit("/", 1)[-1], m["imdisplayname"])
+    rows = [{"id": x["id"], "name": seen.get(x["id"]), "role": x.get("role")} for x in d.get("members", [])]
+    known = {r["id"] for r in rows}
+    rows += [{"id": i, "name": n, "role": None} for i, n in seen.items() if i not in known]
+    total = (d.get("rosterSummary") or {}).get("memberCount") or len(d.get("members", []))
+    if a.json:
+        print(json.dumps({"chat_id": cid, "member_count": total, "members": rows}, ensure_ascii=False, indent=1))
+        return
+    print(f"{total} members (list may be partial for large chats)")
+    for r in rows:
+        print(f"  {r['name'] or '?':40} {r['role'] or '':6} {r['id']}")
 
 
 def resolve(sel):
@@ -555,6 +601,10 @@ def main():
     r.add_argument("--before", help="only messages older than this message id (for paging up)")
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_read)
+    mb = sub.add_parser("members", help="participants of a chat (partial for large chats)")
+    mb.add_argument("chat")
+    mb.add_argument("--json", action="store_true")
+    mb.set_defaults(fn=cmd_members)
     w = sub.add_parser("watch", help="live incoming messages via Trouter websocket")
     w.add_argument("chats", nargs="*", help="chat numbers/id fragments to follow (default: all)")
     w.add_argument("--json", action="store_true", help="one JSON object per line")
