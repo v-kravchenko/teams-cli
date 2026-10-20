@@ -120,6 +120,10 @@ TEAMS_LIVE=1 python3 -m unittest discover -s tests -p 'test_live.py' -v
 - `tools/teams_perf.py`: read-only render benchmark of teams-for-linux over CDP (wheel scroll only)
 - `tools/graph_probe.py`: showed that the Teams Graph token has no `Chat.Read*` scopes (HTTP 403)
 
+## License
+
+GPL-3.0-or-later, see [LICENSE](LICENSE). Not affiliated with Microsoft.
+
 ## Not done
 
 Non-image files (SharePoint, other auth), cards, starting a 1:1 chat that does not exist yet, replying in a channel
