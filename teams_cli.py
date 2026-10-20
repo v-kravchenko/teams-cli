@@ -366,6 +366,10 @@ def cmd_chats(a):
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
+    if a.ids:
+        for r in rows:
+            print(f"{r['n']:>3}  {r['id']}  {r['title']}")
+        return
     for r in rows:
         badge = f"({r['unread']}{'+' if r['unread_capped'] else ''})" if r["unread"] else ""
         prev = r["preview"].replace("\n", " ")
@@ -433,6 +437,13 @@ def resolve(sel):
     sys.exit("unknown chat; run `chats` first and pass its number" if not hits else "ambiguous id fragment")
 
 
+def resolve_write(sel):
+    """Writes need the exact chat id: list numbers shift whenever a chat gets new activity."""
+    if ":" not in sel or sel.isdigit():
+        sys.exit("write commands need the full chat id, not a list number (see `chats --ids` or `chats --json`)")
+    return sel
+
+
 def cmd_read(a):
     cid = resolve(a.chat)
     before = int(a.before) if a.before else None
@@ -451,7 +462,7 @@ def cmd_read(a):
 
 
 def cmd_send(a):
-    cid = resolve(a.chat)
+    cid = resolve_write(a.chat)
     title = load().get("titles", {}).get(cid, cid)
     text = a.text or ""
     if not text and not a.image:
@@ -557,7 +568,7 @@ def msg_path(cid, mid, tail=""):
 
 def write_cmd(a, what, fn):
     """Dry run unless --yes; JSON or text result."""
-    cid = resolve(a.chat)
+    cid = resolve_write(a.chat)
     title = load().get("titles", {}).get(cid, cid)
     if not a.yes:
         if a.json:
@@ -827,6 +838,7 @@ def main():
     lg.set_defaults(fn=cmd_login)
     c = sub.add_parser("chats")
     c.add_argument("--json", action="store_true")
+    c.add_argument("--ids", action="store_true", help="print full chat ids (needed by write commands)")
     c.set_defaults(fn=cmd_chats)
     r = sub.add_parser("read")
     r.add_argument("chat")

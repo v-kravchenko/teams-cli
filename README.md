@@ -19,7 +19,7 @@ Below `teams_cli.py` and `teams` are the same.
 
 ```
 teams_cli.py login                          # opens the browser; paste the final blank-page URL back
-teams_cli.py chats [--json]                 # recent conversations: kind, unread count, preview
+teams_cli.py chats [--json|--ids]           # recent conversations: kind, unread count, preview
 teams_cli.py members <chat> [--json]        # participants (partial for large chats)
 teams_cli.py read <chat> [-n 20] [--before ID] [--json]
 teams_cli.py watch [chat ...] [--json]      # live events (Trouter websocket)
@@ -35,7 +35,7 @@ teams_cli.py mark-read <chat> [id] --yes    # moves the read marker (default: ne
 
 `--mention NAME` needs `@NAME` in the text; NAME is part of a name of someone who wrote in the chat recently.
 
-Chat numbers come from the last `chats` run. `0` is usually "Notes (me)", the chat with yourself, a safe place to test.
+Chat numbers come from the last `chats` run and shift with chat activity, so they only work for reads (`read`, `members`, `watch`, `download`). Write commands (`send`, `edit`, `delete`, `react`, `mark-read`) require the full chat id (`chats --ids`, `48:notes` for the self chat). `0` is usually "Notes (me)", the chat with yourself, a safe place to test.
 
 ## Login
 
