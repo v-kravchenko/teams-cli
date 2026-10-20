@@ -212,7 +212,7 @@ def text_of(content, props=None):
     """Plain text of a message: replies, images, emoji, files, cards and reactions are rendered inline."""
     s = content or ""
     s = re.sub(r"<blockquote[^>]*Reply[^>]*>.*?<strong[^>]*>(.*?)</strong>.*?"
-               r"(?:<p itemprop=\"preview\">(.*?)</p>)?</blockquote>",
+               r"(?:<p itemprop=\"preview\">(.*?)</p>)?\s*</blockquote>",
                lambda m: f"> {m.group(1)}: {m.group(2) or ''}\n", s, flags=re.S)
     s = re.sub(r"<img[^>]*AMSImage[^>]*>", "[зображення]", s)
     s = re.sub(r"<img[^>]*Emoji[^>]*alt=\"([^\"]*)\"[^>]*>", r"\1", s)
@@ -250,11 +250,12 @@ def msg_json(m, cid=None):
     reactions = [{"key": e.get("key"), "count": len(e.get("users") or []),
                   "users": [u.get("mri") for u in e.get("users") or []]} for e in _prop_list(props, "emotions") if e.get("users")]
     reply = None
-    q = _prop_list(props, "qtdMsgs")
-    if q and isinstance(q[0], dict):
-        reply = {"id": str(q[0].get("messageId")), "from_id": q[0].get("sender")}
-        pv = re.search(r'itemprop="preview">(.*?)</p>', content, re.S)
-        reply["preview"] = html.unescape(re.sub(r"<[^>]+>", "", pv.group(1))) if pv else None
+    bq = re.search(r'<blockquote[^>]*schema.skype.com/Reply[^>]*itemid="(\d+)"[^>]*>(.*?)</blockquote>', content, re.S)
+    if bq:
+        who = re.search(r'itemprop="mri"[^>]*itemid="([^"]+)"', bq.group(2))
+        pv = re.search(r'itemprop="preview">(.*?)</p>', bq.group(2), re.S)
+        reply = {"id": bq.group(1), "from_id": who.group(1) if who else None,
+                 "preview": html.unescape(re.sub(r"<[^>]+>", "", pv.group(1))) if pv else None}
     frm = m.get("from") or ""
     return {"id": m.get("id"), "chat_id": cid or m.get("conversationid"), "time": m.get("composetime"),
             "from": m.get("imdisplayname"), "from_id": frm.rsplit("/", 1)[-1] or None,
@@ -427,12 +428,18 @@ def cmd_send(a):
             return
         print(f"DRY RUN. Would send to {title!r}:\n{text}\n\n(add --yes to really send)")
         return
-    me = my_oid()
-    self_name = next((m["imdisplayname"] for m in msgs_of(cid, 30)
-                      if m.get("imdisplayname") and me in (m.get("from") or "")), "")
+    content = html.escape(text).replace("\n", "<br>")
+    if a.reply_to:
+        q = next((m for m in iter_msgs(cid, max_pages=5) if m.get("id") == a.reply_to), None)
+        if not q:
+            sys.exit(f"message {a.reply_to} not found in recent history of this chat")
+        preview = html.escape(text_of(q.get("content"))[:200])
+        content = (f'<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="{q["id"]}">'
+                   f'<strong itemprop="mri" itemid="{(q.get("from") or "").rsplit("/", 1)[-1]}">{html.escape(q.get("imdisplayname") or "")}</strong>'
+                   f'<span itemprop="time" itemid="{q["id"]}"></span><p itemprop="preview">{preview}</p></blockquote><p>{content}</p>')
     body = {"clientmessageid": str(int(time.time() * 1000)),
-            "content": html.escape(text).replace("\n", "<br>"),
-            "messagetype": "RichText/Html", "contenttype": "text", "imdisplayname": self_name}
+            "content": content,
+            "messagetype": "RichText/Html", "contenttype": "text", "imdisplayname": self_name(cid)}
     r = chat_call("POST", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/messages", body)
     if a.json:
         print(json.dumps({"sent": True, "chat_id": cid, "id": str((r or {}).get("OriginalArrivalTime") or "") or None, "client_id": body["clientmessageid"], "text": text}, ensure_ascii=False))
@@ -735,6 +742,7 @@ def main():
     sd = sub.add_parser("send")
     sd.add_argument("chat")
     sd.add_argument("text")
+    sd.add_argument("--reply-to", metavar="ID", help="quote this message id")
     sd.add_argument("--json", action="store_true")
     sd.add_argument("--yes", action="store_true", help="really send (default is a dry run)")
     sd.set_defaults(fn=cmd_send)
