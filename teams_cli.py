@@ -198,10 +198,41 @@ def my_oid():
     return (c.get("skypeid") or "").split(":")[-1]
 
 
-def text_of(content):
-    s = re.sub(r"<br\s*/?>|</p>", "\n", content or "")
+def _prop_list(props, key):
+    v = (props or {}).get(key)
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return []
+    return v if isinstance(v, list) else []
+
+
+def text_of(content, props=None):
+    """Plain text of a message: replies, images, emoji, files, cards and reactions are rendered inline."""
+    s = content or ""
+    s = re.sub(r"<blockquote[^>]*Reply[^>]*>.*?<strong[^>]*>(.*?)</strong>.*?"
+               r"(?:<p itemprop=\"preview\">(.*?)</p>)?</blockquote>",
+               lambda m: f"> {m.group(1)}: {m.group(2) or ''}\n", s, flags=re.S)
+    s = re.sub(r"<img[^>]*AMSImage[^>]*>", "[зображення]", s)
+    s = re.sub(r"<img[^>]*Emoji[^>]*alt=\"([^\"]*)\"[^>]*>", r"\1", s)
+    s = re.sub(r"<img[^>]*alt=\"([^\"]*)\"[^>]*>", r"[\1]", s)
+    s = re.sub(r"<br\s*/?>|</p>|</li>", "\n", s)
     s = re.sub(r"<[^>]+>", "", s)
-    return html.unescape(s).strip()
+    s = re.sub(r"[ \t]*\n\s*\n(\s*\n)*", "\n\n", html.unescape(s)).strip()
+    for f in _prop_list(props, "files"):
+        s += f"\n[файл: {f.get('fileName') or f.get('title') or '?'}]"
+    for c in _prop_list(props, "cards"):
+        s += f"\n[картка: {c.get('content', {}).get('title') or c.get('contentType') or '?'}]" \
+            if isinstance(c, dict) else "\n[картка]"
+    for e in _prop_list(props, "emotions"):
+        n = len(e.get("users") or [])
+        s += f"\n  ↳ {e.get('key')}×{n}"
+    return s.strip()
+
+
+def msg_text(m):
+    return text_of(m.get("content"), m.get("properties"))
 
 
 def ts(s):
@@ -244,7 +275,7 @@ def cmd_chats(a):
         else:
             nm = peer_name(c["id"], names) if c["id"].endswith("@unq.gbl.spaces") else None
             title = f"[1:1] {nm}" if nm else "[chat]"
-        text = text_of(last.get("content"))
+        text = msg_text(last)
         preview = f"{last.get('imdisplayname') or '?'}: {text}" if text else f"{last.get('imdisplayname') or '?'}: <{last.get('messagetype', '?')}>"
         rows.append({"n": i, "id": c["id"], "title": title, "time": last.get("composetime"),
                      "from": last.get("imdisplayname"), "preview": preview})
@@ -274,11 +305,11 @@ def cmd_read(a):
     msgs = sorted(msgs, key=lambda m: m.get("composetime", ""))[-a.n:]
     if a.json:
         print(json.dumps([{"id": m.get("id"), "time": m.get("composetime"), "from": m.get("imdisplayname"),
-                           "text": text_of(m.get("content")), "type": m.get("messagetype")} for m in msgs],
+                           "text": msg_text(m), "type": m.get("messagetype")} for m in msgs],
                          ensure_ascii=False, indent=1))
         return
     for m in msgs:
-        print(f"[{ts(m.get('composetime'))}] {m.get('imdisplayname') or '?'}: {text_of(m.get('content'))}")
+        print(f"[{ts(m.get('composetime'))}] {m.get('imdisplayname') or '?'}: {msg_text(m)}")
 
 
 def cmd_send(a):
@@ -365,7 +396,7 @@ def emit(res, kind, want, as_json, seen):
     seen.add(mid)
     st = load()
     title = st.get("titles", {}).get(cid) or st.get("names", {}).get(cid) or cid[-24:]
-    text = text_of(res.get("content")) or f"<{res.get('messagetype', '?')}>"
+    text = msg_text(res) or f"<{res.get('messagetype', '?')}>"
     who = res.get("imdisplayname") or "?"
     if as_json:
         print(json.dumps({"time": res.get("composetime"), "chat_id": cid, "chat": title, "from": who,
