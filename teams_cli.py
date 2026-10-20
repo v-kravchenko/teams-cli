@@ -85,6 +85,14 @@ def save(st):
         json.dump(data, f)
 
 
+class TeamsError(Exception):
+    """Any failure the caller should show to the user (HTTP errors, bad arguments, not logged in)."""
+
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
+
+
 def http(method, url, headers=None, data=None, raw=False):
     req = urllib.request.Request(url, data=data, method=method, headers={"User-Agent": UA, **(headers or {})})
     try:
@@ -95,7 +103,7 @@ def http(method, url, headers=None, data=None, raw=False):
             return r.status, (json.loads(body) if body else None)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
-        sys.exit(f"HTTP {e.code} {method} {urllib.parse.urlsplit(url).netloc}{urllib.parse.urlsplit(url).path}: {body[:300]}")
+        raise TeamsError(f"HTTP {e.code} {method} {urllib.parse.urlsplit(url).netloc}{urllib.parse.urlsplit(url).path}: {body[:300]}", e.code)
 
 
 def token_request(form):
@@ -127,7 +135,7 @@ def cmd_login(a):
         url = input("URL: ").strip()
     m = re.search(r"[?&]code=([^&\s]+)", url)
     if not m:
-        sys.exit("no code= in the pasted URL; copy the whole address of the blank page")
+        raise TeamsError("no code= in the pasted URL; copy the whole address of the blank page")
     d = token_request({"grant_type": "authorization_code", "code": urllib.parse.unquote(m.group(1)),
                        "redirect_uri": REDIRECT})
     st = load()
@@ -144,7 +152,7 @@ def access():
     """OAuth access token for api.spaces.skype.com; refreshes (and rotates the refresh token) as needed."""
     st = load()
     if not st.get("refresh_token"):
-        sys.exit("not logged in: run `login` first")
+        raise TeamsError("not logged in: run `login` first")
     if st.get("access_token") and st.get("access_exp", 0) > time.time() + 120:
         return st["access_token"]
     d = token_request({"grant_type": "refresh_token", "refresh_token": st["refresh_token"]})
@@ -175,7 +183,7 @@ def session():
     if DEBUG:
         print("authz keys:", sorted(a), "| chat_host:", st["chat_host"], file=sys.stderr)
     if not st["skype_token"]:
-        sys.exit("authz returned no skype token")
+        raise TeamsError("authz returned no skype token")
     save(st)
     return st["skype_token"], st["chat_host"]
 
@@ -290,7 +298,7 @@ def msg_json(m, cid=None):
     frm = m.get("from") or ""
     return {"id": m.get("id"), "chat_id": cid or m.get("conversationid"), "time": m.get("composetime"),
             "from": m.get("imdisplayname"), "from_id": frm.rsplit("/", 1)[-1] or None,
-            "type": m.get("messagetype"), "text": text_of(content), "html": content,
+            "type": m.get("messagetype"), "text": text_of(content, props), "html": content,
             "attachments": att, "mentions": [{"id": x.get("mri"), "name": x.get("displayName")} for x in _prop_list(props, "mentions") if isinstance(x, dict)],
             "reactions": reactions, "reply_to": reply,
             "thread_id": m.get("rootMessageId") if m.get("rootMessageId") != m.get("id") else None,
@@ -367,7 +375,8 @@ def chat_state(c, me):
     return newest, unread, bool(page) and len(page) >= 30 and unread == len(page)
 
 
-def cmd_chats(a):
+def list_chats():
+    """Recent conversations, newest first; also refreshes the cached chat numbers and titles."""
     from concurrent.futures import ThreadPoolExecutor
     d = chat_get("/v1/users/ME/conversations?startTime=0&pageSize=50&view=msnp24Equivalent&targetType=" + TARGETS)
     convs = [c for c in d.get("conversations", []) if c["id"] not in ("48:notifications", "48:threads")]
@@ -395,6 +404,11 @@ def cmd_chats(a):
                      "unread": unread, "unread_capped": capped, "read_up_to": str(horizon_of(c)) if horizon_of(c) else None})
         st.setdefault("titles", {})[c["id"]] = title
     save(st)
+    return rows
+
+
+def cmd_chats(a):
+    rows = list_chats()
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
@@ -425,13 +439,13 @@ def build_mentions(cid, text, queries):
     for q in queries:
         hits = {i: n for i, n in ppl.items() if q.lower() in n.lower()}
         if len(hits) != 1:
-            sys.exit(f"mention {q!r}: " + ("no one with that name seen in this chat" if not hits
+            raise TeamsError(f"mention {q!r}: " + ("no one with that name seen in this chat" if not hits
                                            else "ambiguous: " + ", ".join(hits.values())))
         (mri, name), = hits.items()
         token = "@" + html.escape(q)
         pat = re.compile(re.escape(token), re.I)
         if not pat.search(content):
-            sys.exit(f"mention {q!r}: write @{q} in the text where the mention should go")
+            raise TeamsError(f"mention {q!r}: write @{q} in the text where the mention should go")
         idx = len(mentions)
         content = pat.sub(lambda _: f'<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="{idx}">{html.escape(name)}</span>', content, count=1)
         mentions.append({"@type": "http://schema.skype.com/Mention", "itemid": idx, "mri": mri,
@@ -439,8 +453,8 @@ def build_mentions(cid, text, queries):
     return content, mentions
 
 
-def cmd_members(a):
-    cid = resolve(a.chat)
+def chat_members(cid):
+    """{chat_id, member_count, members: [{id, name, role}]}; the list may be partial for large chats."""
     d = chat_get(f"/v1/threads/{urllib.parse.quote(cid, safe='')}?view=msnp24Equivalent")
     seen = {}
     for m in msgs_of(cid, 100):
@@ -453,11 +467,16 @@ def cmd_members(a):
     for r in rows:
         r["name"] = r["name"] or names.get(r["id"])
     total = (d.get("rosterSummary") or {}).get("memberCount") or len(d.get("members", []))
+    return {"chat_id": cid, "member_count": total, "members": rows}
+
+
+def cmd_members(a):
+    res = chat_members(resolve(a.chat))
     if a.json:
-        print(json.dumps({"chat_id": cid, "member_count": total, "members": rows}, ensure_ascii=False, indent=1))
+        print(json.dumps(res, ensure_ascii=False, indent=1))
         return
-    print(f"{total} members (list may be partial for large chats)")
-    for r in rows:
+    print(f"{res['member_count']} members (list may be partial for large chats)")
+    for r in res["members"]:
         print(f"  {r['name'] or '?':40} {r['role'] or '':6} {r['id']}")
 
 
@@ -485,13 +504,18 @@ def profiles(mris):
     return out_
 
 
-def cmd_people(a):
+def search_people(query, n=10):
+    """Directory search by name or email: [{id, name, email, title, department, chat_id}]."""
     d = mt_call("users/searchV2?includeDLs=true&includeBots=true&enableGuest=true&source=newChat&skypeTeamsInfo=true",
-                a.query)  # the body is the raw text, not JSON
-    rows = [{"id": u.get("mri"), "name": u.get("displayName"), "email": u.get("email") or u.get("mail"),
+                query)  # the body is the raw text, not JSON
+    return [{"id": u.get("mri"), "name": u.get("displayName"), "email": u.get("email") or u.get("mail"),
              "title": u.get("jobTitle"), "department": u.get("department"),
              "chat_id": one_to_one_id(u["mri"]) if (u.get("mri") or "").startswith("8:orgid:") else None}
-            for u in (d or {}).get("value", [])][:a.n]
+            for u in (d or {}).get("value", [])][:n]
+
+
+def cmd_people(a):
+    rows = search_people(a.query, a.n)
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
@@ -500,8 +524,9 @@ def cmd_people(a):
         print(f"{'':40} {r['id']}  1:1: {r['chat_id']}")
 
 
-def cmd_presence(a):
-    mris = [mri_of(x) for x in a.who or ["me"]]
+def get_presence(who):
+    """Availability of people ('me', object ids or mris): [{id, availability, activity, out_of_office, ...}]."""
+    mris = [mri_of(x) for x in who or ["me"]]
     hdr = {"Authorization": "Bearer " + resource_token(PRESENCE, "presence_token"), "Accept": "application/json",
            "Content-Type": "application/json", "x-ms-client-user-agent": "Teams-V2-Desktop", "x-ms-correlation-id": "1"}
     rows = []
@@ -513,6 +538,11 @@ def cmd_presence(a):
             rows.append({"id": x.get("mri"), "availability": p.get("availability"), "activity": p.get("activity"),
                          "out_of_office": bool((p.get("calendarData") or {}).get("isOutOfOffice")),
                          "last_active": p.get("lastActiveTime"), "device": p.get("deviceType")})
+    return rows
+
+
+def cmd_presence(a):
+    rows = get_presence(a.who)
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
@@ -529,9 +559,10 @@ def _addr(x):
     return e.get("Name") or e.get("Address")
 
 
-def cmd_search(a):
-    body = {"EntityRequests": [{"EntityType": "Message", "ContentSources": ["Teams"], "Query": {"QueryString": a.query},
-                                "From": 0, "Size": a.n}],
+def search_messages(query, n=20, skip=0):
+    """Server-side message search in all chats: {total, results: [{id, chat_id, thread_id, chat, from, time, text}]}."""
+    body = {"EntityRequests": [{"EntityType": "Message", "ContentSources": ["Teams"], "Query": {"QueryString": query},
+                                "From": skip, "Size": n}],
             "Cvid": str(uuid.uuid4()), "Scenario": {"Name": "powerbar"}}
     _, d = http("POST", SUBSTRATE + "/search/api/v2/query",
                 {"Authorization": "Bearer " + resource_token(SUBSTRATE, "substrate_token"),
@@ -550,11 +581,16 @@ def cmd_search(a):
         rows.append({"id": mid, "chat_id": conv or None, "thread_id": root if root and "@thread.tacv2" in conv else None, "chat": where, "from": _addr(s.get("From") or s.get("Sender")),
                      "time": s.get("DateTimeSent") or s.get("DateTimeReceived"),
                      "text": s.get("Preview") or h.get("HitHighlightedSummary")})
+    return {"total": total, "results": rows}
+
+
+def cmd_search(a):
+    res = search_messages(a.query, a.n)
     if a.json:
-        print(json.dumps({"total": total, "results": rows}, ensure_ascii=False, indent=1))
+        print(json.dumps(res, ensure_ascii=False, indent=1))
         return
-    print(f"{total} matches, showing {len(rows)}")
-    for r in rows:
+    print(f"{res['total']} matches, showing {len(res['results'])}")
+    for r in res["results"]:
         print(f"[{ts(r['time'])}] {(r['chat'] or '')[:30]:30} {r['from'] or '?'}: {(r['text'] or '').replace(chr(10), ' ')[:90]}")
         print(f"{'':22}{r['chat_id']}")
 
@@ -569,77 +605,95 @@ def resolve(sel):
     hits = [i for i in ids if sel in i]
     if len(hits) == 1:
         return hits[0]
-    sys.exit("unknown chat; run `chats` first and pass its number" if not hits else "ambiguous id fragment")
+    raise TeamsError("unknown chat; run `chats` first and pass its number" if not hits else "ambiguous id fragment")
 
 
 def resolve_write(sel):
     """Writes need the exact chat id: list numbers shift whenever a chat gets new activity."""
     if ":" not in sel or sel.isdigit():
-        sys.exit("write commands need the full chat id, not a list number (see `chats --ids` or `chats --json`)")
+        raise TeamsError("write commands need the full chat id, not a list number (see `chats --ids` or `chats --json`)")
     return sel
 
 
-def cmd_read(a):
-    cid = resolve(a.chat)
-    before = int(a.before) if a.before else None
+def read_messages(cid, n=10, before=None):
+    """Recent messages (oldest first) in the msg_json shape; `before` pages up from a message id."""
     msgs = []
     for m in iter_msgs(cid):
         if m.get("messagetype") in REAL_TYPES and (before is None or int(m["id"]) < before):
             msgs.append(m)
-            if len(msgs) >= a.n:
+            if len(msgs) >= n:
                 break
     msgs.reverse()
+    return [msg_json(m, cid) for m in msgs]
+
+
+def cmd_read(a):
+    rows = read_messages(resolve(a.chat), a.n, int(a.before) if a.before else None)
     if a.json:
-        print(json.dumps([msg_json(m, cid) for m in msgs], ensure_ascii=False, indent=1))
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
-    for m in msgs:
-        print(f"[{ts(m.get('composetime'))}] {m.get('imdisplayname') or '?'}: {msg_text(m) or ('(deleted)' if (m.get('properties') or {}).get('deletetime') else '')}")
+    for r in rows:
+        print(f"[{ts(r['time'])}] {r['from'] or '?'}: {r['text'] or ('(deleted)' if r['deleted'] else '')}")
 
 
-def cmd_send(a):
-    cid = resolve_write(a.chat)
-    title = load().get("titles", {}).get(cid, cid)
-    text = a.text or ""
-    if not text and not a.image:
-        sys.exit("nothing to send: give text and/or --image")
-    content, mentions = build_mentions(cid, text, a.mention or [])
-    if a.reply_to:
-        q = next((m for m in iter_msgs(cid, max_pages=5) if m.get("id") == a.reply_to), None)
+def prepare_send(cid, text="", reply_to=None, mentions=(), image=None):
+    """Validate a send and build its content: {content, mentions, reply_to, image}."""
+    if not text and not image:
+        raise TeamsError("nothing to send: give text and/or --image")
+    content, built = build_mentions(cid, text, mentions)
+    if reply_to:
+        q = next((m for m in iter_msgs(cid, max_pages=5) if m.get("id") == reply_to), None)
         if not q:
-            sys.exit(f"message {a.reply_to} not found in recent history of this chat")
+            raise TeamsError(f"message {reply_to} not found in recent history of this chat")
         preview = html.escape(text_of(q.get("content"))[:200])
         content = (f'<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="{q["id"]}">'
                    f'<strong itemprop="mri" itemid="{(q.get("from") or "").rsplit("/", 1)[-1]}">{html.escape(q.get("imdisplayname") or "")}</strong>'
                    f'<span itemprop="time" itemid="{q["id"]}"></span><p itemprop="preview">{preview}</p></blockquote><p>{content}</p>')
-    if a.image:
-        if os.path.splitext(a.image)[1].lower() not in IMG_TYPES:
-            sys.exit(f"unsupported image type; supported: {', '.join(IMG_TYPES)}")
-        if not os.path.isfile(a.image):
-            sys.exit(f"no such file: {a.image}")
-    if not a.yes:
-        extra = {"reply_to": a.reply_to, "mentions": [m["displayName"] for m in mentions], "image": a.image}
-        if a.json:
-            print(json.dumps({"sent": False, "dry_run": True, "chat_id": cid, "text": text, **extra}, ensure_ascii=False))
-            return
-        notes = "".join(f"\n  {k}: {v}" for k, v in extra.items() if v)
-        print(f"DRY RUN. Would send to {title!r}:\n{text}{notes}\n\n(add --yes to really send)")
-        return
-    if a.image:
-        _, tag = upload_image(cid, a.image)
-        if a.reply_to:
+    if image:
+        if os.path.splitext(image)[1].lower() not in IMG_TYPES:
+            raise TeamsError(f"unsupported image type; supported: {', '.join(IMG_TYPES)}")
+        if not os.path.isfile(image):
+            raise TeamsError(f"no such file: {image}")
+    return {"content": content, "mentions": built, "reply_to": reply_to, "image": image}
+
+
+def send_prepared(cid, p, text=""):
+    """POST a prepared message (uploads the image if any): {chat_id, id, client_id, text}."""
+    content = p["content"]
+    if p["image"]:
+        _, tag = upload_image(cid, p["image"])
+        if p["reply_to"]:
             content += f"<p>{tag}</p>"
         else:
             content = (f"<p>{content}</p>" if text else "") + f"<p>{tag}</p>"
     body = {"clientmessageid": str(int(time.time() * 1000)),
             "content": content,
             "messagetype": "RichText/Html", "contenttype": "text", "imdisplayname": self_name(cid)}
-    if mentions:
-        body["properties"] = {"mentions": json.dumps(mentions, ensure_ascii=False)}
+    if p["mentions"]:
+        body["properties"] = {"mentions": json.dumps(p["mentions"], ensure_ascii=False)}
     r = chat_call("POST", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/messages", body)
-    if a.json:
-        print(json.dumps({"sent": True, "chat_id": cid, "id": str((r or {}).get("OriginalArrivalTime") or "") or None, "client_id": body["clientmessageid"], "text": text}, ensure_ascii=False))
+    return {"chat_id": cid, "id": str((r or {}).get("OriginalArrivalTime") or "") or None,
+            "client_id": body["clientmessageid"], "text": text}
+
+
+def cmd_send(a):
+    cid = resolve_write(a.chat)
+    title = load().get("titles", {}).get(cid, cid)
+    text = a.text or ""
+    p = prepare_send(cid, text, a.reply_to, a.mention or [], a.image)
+    if not a.yes:
+        extra = {"reply_to": p["reply_to"], "mentions": [m["displayName"] for m in p["mentions"]], "image": p["image"]}
+        if a.json:
+            print(json.dumps({"sent": False, "dry_run": True, "chat_id": cid, "text": text, **extra}, ensure_ascii=False))
+            return
+        notes = "".join(f"\n  {k}: {v}" for k, v in extra.items() if v)
+        print(f"DRY RUN. Would send to {title!r}:\n{text}{notes}\n\n(add --yes to really send)")
         return
-    print(f"sent to {title!r}", "" if DEBUG else "", (r or {}) if DEBUG else "")
+    res = send_prepared(cid, p, text)
+    if a.json:
+        print(json.dumps({"sent": True, **res}, ensure_ascii=False))
+        return
+    print(f"sent to {title!r}", "" if DEBUG else "", res if DEBUG else "")
 
 
 AMS = "https://eu-api.asm.skype.com"
@@ -654,7 +708,7 @@ def upload_image(cid, path):
     """Upload an image to AMS; returns (object id, image tag html)."""
     ext = os.path.splitext(path)[1].lower()
     if ext not in IMG_TYPES:
-        sys.exit(f"unsupported image type {ext!r}; supported: {', '.join(IMG_TYPES)}")
+        raise TeamsError(f"unsupported image type {ext!r}; supported: {', '.join(IMG_TYPES)}")
     data = open(path, "rb").read()
     _, obj = http("POST", AMS + "/v1/objects", ams_headers({"Content-Type": "application/json"}),
                   json.dumps({"type": "pish/image", "permissions": {cid: ["read"]},
@@ -666,12 +720,12 @@ def upload_image(cid, path):
     return oid, tag
 
 
-def cmd_download(a):
-    cid = resolve(a.chat)
-    m = next((m for m in iter_msgs(cid, max_pages=10) if m.get("id") == a.id), None)
+def download_attachments(cid, mid, out="."):
+    """Save the image attachments of one message; SharePoint files come back as urls."""
+    m = next((m for m in iter_msgs(cid, max_pages=10) if m.get("id") == mid), None)
     if not m:
-        sys.exit(f"message {a.id} not found in recent history of this chat")
-    os.makedirs(a.out, exist_ok=True)
+        raise TeamsError(f"message {mid} not found in recent history of this chat")
+    os.makedirs(out, exist_ok=True)
     saved = []
     for i, att in enumerate(msg_json(m, cid)["attachments"]):
         if att["kind"] == "image" and "asm.skype" in (att.get("url") or ""):
@@ -679,11 +733,16 @@ def cmd_download(a):
             with urllib.request.urlopen(req, timeout=60) as r:
                 body = r.read()
                 ext = {"image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}.get(r.headers.get("Content-Type"), ".jpg")
-            path = os.path.join(a.out, f"{a.id}_{i}{ext}")
+            path = os.path.join(out, f"{mid}_{i}{ext}")
             open(path, "wb").write(body)
             saved.append({"kind": "image", "path": path})
         elif att["kind"] == "file":
             saved.append({"kind": "file", "name": att.get("name"), "url": att.get("url"), "note": "SharePoint file: open the url in a browser (not downloadable via this API)"})
+    return saved
+
+
+def cmd_download(a):
+    saved = download_attachments(resolve(a.chat), a.id, a.out)
     if a.json:
         print(json.dumps(saved, ensure_ascii=False, indent=1))
     else:
@@ -719,37 +778,51 @@ def write_cmd(a, what, fn):
         print(f"done: {what} in {title!r}")
 
 
+def edit_message(cid, mid, text):
+    body = {"content": html.escape(text).replace("\n", "<br>"), "messagetype": "RichText/Html",
+            "contenttype": "text", "imdisplayname": self_name(cid)}
+    chat_call("PUT", msg_path(cid, mid), body)
+
+
+def delete_message(cid, mid):
+    chat_call("DELETE", msg_path(cid, mid, "?behavior=softDelete"))
+
+
+def react(cid, mid, emoji, remove=False):
+    path = msg_path(cid, mid, "/properties?name=emotions")
+    if remove:
+        chat_call("DELETE", path, {"emotions": {"key": emoji}})
+    else:
+        chat_call("PUT", path, {"emotions": {"key": emoji, "value": int(time.time() * 1000)}})
+
+
+def mark_read(cid, mid=None):
+    """Mark everything up to `mid` (default: newest message) read; returns the message id."""
+    mid = mid or next((m["id"] for m in iter_msgs(cid, page=10, max_pages=1)), None)
+    if not mid:
+        raise TeamsError("nothing to mark as read")
+    now = int(time.time() * 1000)
+    chat_call("PUT", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/properties?name=consumptionhorizon",
+              {"consumptionhorizon": f"{mid};{now};{now}"})
+    return mid
+
+
 def cmd_edit(a):
-    def run(cid):
-        body = {"content": html.escape(a.text).replace("\n", "<br>"), "messagetype": "RichText/Html",
-                "contenttype": "text", "imdisplayname": self_name(cid)}
-        chat_call("PUT", msg_path(cid, a.id), body)
-    write_cmd(a, f"edit message {a.id} -> {a.text!r}", run)
+    write_cmd(a, f"edit message {a.id} -> {a.text!r}", lambda cid: edit_message(cid, a.id, a.text))
 
 
 def cmd_delete(a):
-    write_cmd(a, f"delete message {a.id}", lambda cid: chat_call("DELETE", msg_path(cid, a.id, "?behavior=softDelete")))
+    write_cmd(a, f"delete message {a.id}", lambda cid: delete_message(cid, a.id))
 
 
 def cmd_react(a):
-    def run(cid):
-        path = msg_path(cid, a.id, "/properties?name=emotions")
-        if a.remove:
-            chat_call("DELETE", path, {"emotions": {"key": a.emoji}})
-        else:
-            chat_call("PUT", path, {"emotions": {"key": a.emoji, "value": int(time.time() * 1000)}})
-    write_cmd(a, f"{'remove' if a.remove else 'add'} reaction {a.emoji} on {a.id}", run)
+    write_cmd(a, f"{'remove' if a.remove else 'add'} reaction {a.emoji} on {a.id}",
+              lambda cid: react(cid, a.id, a.emoji, a.remove))
 
 
 def cmd_mark_read(a):
     def run(cid):
-        mid = a.id or next((m["id"] for m in iter_msgs(cid, page=10, max_pages=1)), None)
-        if not mid:
-            sys.exit("nothing to mark as read")
-        a.id = mid
-        now = int(time.time() * 1000)
-        chat_call("PUT", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/properties?name=consumptionhorizon",
-                  {"consumptionhorizon": f"{mid};{now};{now}"})
+        a.id = mark_read(cid, a.id)
     write_cmd(a, f"mark read up to {a.id or 'newest'}", run)
 
 
@@ -815,58 +888,67 @@ def out(obj):
     print(json.dumps(obj, ensure_ascii=False), flush=True)
 
 
-def status(as_json, state, **kw):
-    if as_json:
-        out({"event": "status", "state": state, **kw})
-    else:
-        print(f"[{state}] " + " ".join(f"{k}={v}" for k, v in kw.items()), file=sys.stderr, flush=True)
+def status(state, **kw):
+    """Watch status event (connected, stalled, disconnected, ...)."""
+    return {"event": "status", "state": state, **kw}
 
 
-def emit_read(res, want, as_json, horizons):
-    """ConversationUpdate -> `read` event when the read marker moved (JSON mode only)."""
+def emit_read(res, want, horizons):
+    """ConversationUpdate -> `read` event when the read marker moved."""
     cid = res.get("id")
     hz = horizon_of(res)
-    if not as_json or not hz or (want and cid not in want) or horizons.get(cid) == hz:
-        return
+    if not hz or (want and cid not in want) or horizons.get(cid) == hz:
+        return None
     horizons[cid] = hz
-    out({"event": "read", "chat_id": cid, "read_up_to": str(hz)})
+    return {"event": "read", "chat_id": cid, "read_up_to": str(hz)}
 
 
-def emit(res, kind, want, as_json, seen):
+def emit(res, kind, want, seen):
+    """Trouter message -> event dict, or None when it is filtered out or already seen."""
     cid = res.get("conversationid") or (res.get("conversationLink") or "").rsplit("/", 1)[-1]
     if want and cid not in want:
-        return
+        return None
     mt = res.get("messagetype") or ""
     props = res.get("properties") or {}
     base = msg_json(res, cid)
     if mt.startswith("Control/"):
-        if as_json and mt in ("Control/Typing", "Control/ClearTyping"):
-            out({"event": "typing" if mt == "Control/Typing" else "typing_stop", "chat_id": cid,
-                 "from": base["from"], "from_id": base["from_id"], "time": base["time"]})
-        return
+        if mt not in ("Control/Typing", "Control/ClearTyping"):
+            return None
+        return {"event": "typing" if mt == "Control/Typing" else "typing_stop", "chat_id": cid,
+                "from": base["from"], "from_id": base["from_id"], "time": base["time"]}
     mid = (res.get("id"), res.get("version"))
     if mid in seen:
-        return
+        return None
     seen.add(mid)
     st = load()
     title = st.get("titles", {}).get(cid) or st.get("names", {}).get(cid) or cid[-24:]
     if mt not in REAL_TYPES:
-        if as_json:
-            out({**base, "chat": title, "event": "system"})
-        return
+        return {**base, "chat": title, "event": "system"}
     if props.get("deletetime"):
         event = "message_deleted"
     else:
         event = "message" if kind == "NewMessage" else "message_updated"
-    if as_json:
-        out({**base, "chat": title, "event": event})
-    else:
-        text = msg_text(res) or f"<{mt}>"
-        mark = {"message": "", "message_updated": " (edited)", "message_deleted": " (deleted)"}[event]
-        print(f"[{ts(res.get('composetime'))}] {title} | {res.get('imdisplayname') or '?'}: {text}{mark}", flush=True)
+    return {**base, "chat": title, "event": event}
 
 
-async def watch_once(want, as_json, seen, horizons):
+def cli_event(as_json):
+    """Watch events the CLI way: one JSON line each, or the human lines (status to stderr)."""
+    marks = {"message": "", "message_updated": " (edited)", "message_deleted": " (deleted)"}
+
+    def on_event(ev):
+        kind = ev["event"]
+        if as_json:
+            out(ev)
+        elif kind == "status":
+            print(f"[{ev['state']}] " + " ".join(f"{k}={v}" for k, v in ev.items() if k not in ("event", "state")),
+                  file=sys.stderr, flush=True)
+        elif kind in marks:
+            text = ev["text"] or f"<{ev['type']}>"
+            print(f"[{ts(ev['time'])}] {ev['chat']} | {ev['from'] or '?'}: {text}{marks[kind]}", flush=True)
+    return on_event
+
+
+async def watch_once(want, on_event, horizons):
     try:
         import websockets
     except ImportError:
@@ -875,7 +957,7 @@ async def watch_once(want, as_json, seen, horizons):
         try:
             import websockets
         except ImportError:
-            sys.exit("watch needs the websockets package: pip install --user websockets")
+            raise TeamsError("watch needs the websockets package: pip install --user websockets")
     ws_url, cparams, surl = await asyncio.to_thread(trouter_urls)
     async with websockets.connect(ws_url, additional_headers={"X-Skypetoken": session()[0], "User-Agent": UA},
                                   max_size=2**24, ping_interval=None) as ws:
@@ -896,7 +978,7 @@ async def watch_once(want, as_json, seen, horizons):
                 try:
                     await asyncio.to_thread(trouter_register, surl)
                 except Exception as e:
-                    status(as_json, "error", detail=f"reregister failed: {type(e).__name__}: {str(e)[:100]}")
+                    on_event(status("error", detail=f"reregister failed: {type(e).__name__}: {str(e)[:100]}"))
                     await ws.close()
                     return
 
@@ -904,7 +986,7 @@ async def watch_once(want, as_json, seen, horizons):
             while True:
                 await asyncio.sleep(20)
                 if time.monotonic() - last > SILENCE_LIMIT:
-                    status(as_json, "stalled", detail=f"no frames for {SILENCE_LIMIT}s")
+                    on_event(status("stalled", detail=f"no frames for {SILENCE_LIMIT}s"))
                     await ws.close()
                     return
 
@@ -919,7 +1001,7 @@ async def watch_once(want, as_json, seen, horizons):
                 await ws.send("5:::" + json.dumps(auth))
                 await asyncio.to_thread(trouter_register, surl)
                 tasks = [asyncio.create_task(t()) for t in (pinger, reregister, watchdog)]
-                status(as_json, "connected")
+                on_event(status("connected"))
             elif frame.startswith("2::"):
                 await ws.send("2::")
             elif frame.startswith("3:::"):
@@ -928,12 +1010,17 @@ async def watch_once(want, as_json, seen, horizons):
                 if (req.get("url") or "").endswith("/messaging"):
                     ev = decode_event(req)
                     if ev.get("type") == "EventMessage" and ev.get("resourceType") in ("NewMessage", "MessageUpdate"):
-                        emit(ev["resource"], ev["resourceType"], want, as_json, seen)
+                        e = emit(ev["resource"], ev["resourceType"], want, seen)
                     elif ev.get("resourceType") == "ConversationUpdate":
-                        emit_read(ev["resource"], want, as_json, horizons)
+                        e = emit_read(ev["resource"], want, horizons)
                     elif os.environ.get("TEAMS_DUMP"):
                         with open(os.environ["TEAMS_DUMP"], "a") as f:
                             f.write(json.dumps(ev, ensure_ascii=False)[:3000] + "\n")
+                        e = None
+                    else:
+                        e = None
+                    if e:
+                        on_event(e)
             elif frame.startswith("5:") and "trouter.message_loss" in frame:
                 await asyncio.to_thread(trouter_register, surl)
         for t in tasks:
@@ -943,19 +1030,20 @@ async def watch_once(want, as_json, seen, horizons):
 def cmd_watch(a):
     want = {resolve(c) for c in a.chats}
     seen, horizons = set(), {}
+    on_event = cli_event(a.json)
     delay = 2
     while True:
         try:
-            asyncio.run(watch_once(want, a.json, seen, horizons))
+            asyncio.run(watch_once(want, on_event, horizons))
             delay = 2
-            status(a.json, "disconnected", retry_in=delay)
+            on_event(status("disconnected", retry_in=delay))
         except KeyboardInterrupt:
             return
-        except SystemExit as e:
-            status(a.json, "auth_failed", detail=str(e.code))
+        except TeamsError as e:
+            on_event(status("auth_failed", detail=str(e)))
             raise
         except Exception as e:
-            status(a.json, "disconnected", detail=f"{type(e).__name__}: {str(e)[:120]}", retry_in=delay)
+            on_event(status("disconnected", detail=f"{type(e).__name__}: {str(e)[:120]}", retry_in=delay))
         try:
             time.sleep(delay)
         except KeyboardInterrupt:
@@ -1036,11 +1124,11 @@ def main():
     DEBUG = a.debug
     try:
         a.fn(a)
-    except SystemExit as e:
-        if getattr(a, "json", False) and isinstance(e.code, str):
-            print(json.dumps({"error": e.code}, ensure_ascii=False))
+    except TeamsError as e:
+        if getattr(a, "json", False):
+            print(json.dumps({"error": str(e)}, ensure_ascii=False))
             sys.exit(1)
-        raise
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
