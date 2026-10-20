@@ -10,7 +10,7 @@ Tokens go to the GNOME keyring (secret-tool); without one, to ~/.config/teams-cl
   teams_cli.py watch [chat ...] [--json]            # live messages via Trouter (needs websockets)
   teams_cli.py send <n|text> "message" [--yes]   # without --yes only prints what would be sent
 """
-import argparse, asyncio, base64, datetime, gzip, html, json, os, re, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid, webbrowser
+import argparse, asyncio, base64, datetime, gzip, hashlib, html, json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 
 CLIENT_ID = "1fec8e78-bce4-4aaf-ab1b-5451cc387264"  # Teams desktop/web public client
 REDIRECT = "https://login.microsoftonline.com/common/oauth2/nativeclient"
@@ -26,6 +26,10 @@ STATE_DIR = os.path.expanduser("~/.config/teams-cli")
 STATE = os.path.join(STATE_DIR, "state.json")
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "teams-cli")
 CONV_CACHE = os.path.join(CACHE_DIR, "conversations.json")
+CHATINFO_CACHE = os.path.join(CACHE_DIR, "chatinfo.json")
+PROFILES_CACHE = os.path.join(CACHE_DIR, "profiles.json")
+MESSAGES_DIR = os.path.join(CACHE_DIR, "messages")
+CACHE_VERSION = 1
 DEBUG = False
 
 
@@ -56,12 +60,69 @@ def keyring_put(name, value):
         return False
 
 
+def keyring_clear(name):
+    try:
+        subprocess.run(["secret-tool", "clear", "service", "teams-cli", "key", name],
+                       capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _ensure_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _read_cache(path):
+    """Parsed cache file, or None when missing, corrupt or written by a newer version."""
+    try:
+        _ensure_dir(os.path.dirname(path))
+    except OSError:
+        pass
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("version", 0) > CACHE_VERSION:
+        return None
+    return d
+
+
+def _write_cache(path, data):
+    """Atomic write with 0600 from creation; a cache failure must never fail the command."""
+    tmp = None
+    try:
+        d = os.path.dirname(path)
+        _ensure_dir(d)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({**data, "version": CACHE_VERSION}, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        tmp = None
+        return True
+    except OSError as e:
+        print(f"warning: cannot write {path}: {e}", file=sys.stderr)
+        return False
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def load():
     """State = non-secret file + tokens from the keyring (or from the 0600 file as a fallback)."""
     global _cache
     if _cache is None:
         try:
-            st = json.load(open(STATE))
+            with open(STATE, encoding="utf-8") as f:
+                st = json.load(f)
         except (OSError, ValueError):
             st = {}
         for k in SECRET_KEYS:
@@ -72,20 +133,75 @@ def load():
     return dict(_cache)
 
 
+def _write_state(st):
+    """Atomic 0600 write: an interrupted token refresh must not truncate state.json."""
+    _ensure_dir(STATE_DIR)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=STATE_DIR)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE)
+        tmp = None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _strip_legacy_state():
+    """Drop chats/names/titles from state.json after they reached the cache (keeps fallback tokens)."""
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return
+    if any(k in st for k in LEGACY_CACHE_KEYS):
+        _write_state({k: v for k, v in st.items() if k not in LEGACY_CACHE_KEYS})
+
+
+LEGACY_CACHE_KEYS = ("chats", "names", "titles")
+
+
+def chatinfo():
+    """Cached chat ids, titles and peer names; seeded once from the old state.json keys."""
+    info = _read_cache(CHATINFO_CACHE)
+    if info is None:
+        st = load()
+        info = {"chats": st.get("chats") or [], "names": st.get("names") or {},
+                "titles": st.get("titles") or {}}
+        if _write_cache(CHATINFO_CACHE, info):
+            _strip_legacy_state()
+    info.setdefault("chats", [])
+    info.setdefault("names", {})
+    info.setdefault("titles", {})
+    return info
+
+
+def update_chatinfo(**kw):
+    info = chatinfo()
+    info.update(kw)
+    info["updated_at"] = time.time()
+    return _write_cache(CHATINFO_CACHE, info)
+
+
 def save(st):
     global _cache, _warned
     _cache = dict(st)
-    data = dict(st)
+    migrated = True
+    if any(st.get(k) for k in LEGACY_CACHE_KEYS):
+        migrated = update_chatinfo(**{k: st[k] for k in LEGACY_CACHE_KEYS if st.get(k)})
+    data = ({k: v for k, v in st.items() if k not in LEGACY_CACHE_KEYS} if migrated else dict(st))
     for k in SECRET_KEYS:
         if st.get(k) and keyring_put(k, st[k]):
             del data[k]  # only dropped from the file after a verified read-back
         elif st.get(k) and not _warned:
             _warned = True
             print(f"warning: keyring unavailable, tokens kept in {STATE} (mode 0600)", file=sys.stderr)
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-    fd = os.open(STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f)
+    _write_state(data)
 
 
 class TeamsError(Exception):
@@ -112,6 +228,12 @@ def http(method, url, headers=None, data=None, raw=False, retries=3):
                 time.sleep(2 ** attempt)
                 continue
             raise TeamsError(f"HTTP {e.code} {method} {urllib.parse.urlsplit(url).netloc}{urllib.parse.urlsplit(url).path}: {body[:300]}", e.code)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if method == "GET" and attempt + 1 < retries:
+                time.sleep(2 ** attempt)
+                continue
+            u = urllib.parse.urlsplit(url)
+            raise TeamsError(f"{method} {u.netloc}{u.path}: {type(e).__name__}: {e}")
 
 
 def token_request(form):
@@ -122,25 +244,17 @@ def token_request(form):
 
 
 def cmd_login(a):
-    url = a.url
+    """Non-interactive: `login` prints the sign-in URL; `login --url URL|-` finishes the login."""
+    url = sys.stdin.readline().strip() if a.url == "-" else a.url
     if not url:
         auth = (f"https://login.microsoftonline.com/{TENANT}/oauth2/authorize?client_id={CLIENT_ID}"
                 f"&response_type=code&display=popup&prompt=select_account&amr_values=mfa"
                 f"&redirect_uri={urllib.parse.quote(REDIRECT, safe='')}")
-        opened = False
-        try:
-            opened = webbrowser.open(auth)
-        except webbrowser.Error:
-            pass
-        if not opened:
-            print("Open this URL in a browser:\n\n" + auth + "\n")
-        print("1. Sign in to Microsoft in the browser" + (" window that just opened." if opened else "."))
-        print("2. You land on a blank page. Copy its full URL from the address bar (Ctrl+L, Ctrl+C).")
-        if not sys.stdin.isatty():
-            print("3. No terminal input here; run:  teams_cli.py login --url '<copied url>'")
-            return
-        print("3. Paste it here and press Enter.\n")
-        url = input("URL: ").strip()
+        print(auth, flush=True)
+        print("\nAfter signing in you land on a blank page. Copy its full URL and run:\n"
+              "  teams_cli.py login --url '<the copied URL>'\n"
+              "(GUI: pass `-` instead of the URL to read it from stdin.)", file=sys.stderr)
+        return
     m = re.search(r"[?&]code=([^&\s]+)", url)
     if not m:
         raise TeamsError("no code= in the pasted URL; copy the whole address of the blank page")
@@ -224,12 +338,7 @@ def iter_conversations(page_size=200):
 
 def all_conversations(ttl, refresh=False, progress=None):
     """Full conversation list from ~/.cache/teams-cli; refetches when older than ttl seconds or on refresh."""
-    cache = None
-    try:
-        with open(CONV_CACHE) as f:
-            cache = json.load(f)
-    except (OSError, ValueError):
-        pass
+    cache = _read_cache(CONV_CACHE)
     if cache and not refresh and time.time() - cache.get("fetched_at", 0) < ttl:
         return cache.get("conversations") or []
     convs = []
@@ -237,15 +346,7 @@ def all_conversations(ttl, refresh=False, progress=None):
         convs.extend(page)
         if progress:
             progress(len(convs))
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = CONV_CACHE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"fetched_at": time.time(), "conversations": convs}, f)
-        os.chmod(tmp, 0o600)  # previews of private messages
-        os.replace(tmp, CONV_CACHE)
-    except OSError as e:
-        print(f"warning: cannot write {CONV_CACHE}: {e}", file=sys.stderr)
+    _write_cache(CONV_CACHE, {"fetched_at": time.time(), "conversations": convs})
     return convs
 
 
@@ -352,8 +453,26 @@ def msg_json(m, cid=None):
             "edited": bool(props.get("edittime")), "deleted": bool(props.get("deletetime"))}
 
 
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean(s):
+    """Strip terminal control characters (ANSI/OSC) from server-provided text; keeps \\n and \\t."""
+    return _CONTROL.sub("", "" if s is None else str(s))
+
+
 def ts(s):
-    return (s or "")[:19].replace("T", " ")
+    return clean((s or "")[:19].replace("T", " "))
+
+
+def ams_url_ok(url):
+    """True only for https AMS urls: the skype token is sent to whatever host is here."""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+    except ValueError:
+        return False
+    host = (u.hostname or "").lower()
+    return u.scheme == "https" and (host == "asm.skype.com" or host.endswith(".asm.skype.com"))
 
 
 def msgs_of(cid, n=10):
@@ -455,14 +574,41 @@ def chat_row(c, names, me, last=None, unread=None, fetch_names=True, n=None, unr
     return row
 
 
+def _msg_cache_path(cid):
+    return os.path.join(MESSAGES_DIR, hashlib.sha256(cid.encode()).hexdigest()[:32] + ".json")
+
+
+def cache_messages(cid, rows):
+    """Remember the newest page of a chat as an offline fallback."""
+    _write_cache(_msg_cache_path(cid), {"chat_id": cid, "fetched_at": time.time(), "messages": rows[-50:]})
+
+
+def cached_messages(cid):
+    d = _read_cache(_msg_cache_path(cid))
+    if not d or d.get("chat_id") != cid or not isinstance(d.get("messages"), list):
+        return None
+    return d
+
+
+def update_cached_message(cid, row):
+    """Fold a watch event into an existing message cache (no cache, no write)."""
+    d = cached_messages(cid)
+    if d is None:
+        return
+    msgs = [m for m in d["messages"] if m.get("id") != row.get("id")] + [row]
+    msgs.sort(key=lambda m: int(m.get("id") or 0))
+    d["messages"] = msgs[-50:]
+    d["fetched_at"] = time.time()
+    _write_cache(_msg_cache_path(cid), d)
+
+
 def list_chats():
     """Recent conversations, newest first; also refreshes the cached chat numbers and titles."""
     from concurrent.futures import ThreadPoolExecutor
     d = chat_get("/v1/users/ME/conversations?startTime=0&pageSize=50&view=msnp24Equivalent&targetType=" + TARGETS)
     convs = [c for c in d.get("conversations", []) if c["id"] not in ("48:notifications", "48:threads")]
-    st = load()
-    st["chats"] = [c["id"] for c in convs]
-    names = st.setdefault("names", {})
+    info = chatinfo()
+    names = info["names"]
     me = my_oid()
     with ThreadPoolExecutor(8) as ex:
         states = list(ex.map(lambda c: chat_state(c, me), convs))
@@ -470,8 +616,8 @@ def list_chats():
     for i, (c, (last, unread, capped)) in enumerate(zip(convs, states)):
         row = chat_row(c, names, me, last, unread, n=i, unread_capped=capped)
         rows.append(row)
-        st.setdefault("titles", {})[c["id"]] = row["title"]
-    save(st)
+        info["titles"][c["id"]] = row["title"]
+    update_chatinfo(chats=[c["id"] for c in convs], names=names, titles=info["titles"])
     return rows
 
 
@@ -479,8 +625,7 @@ def list_all_chats(refresh=False):
     """Every conversation (chats, channels of all teams) from the cached full list; `unread` is a boolean."""
     convs = all_conversations(900, refresh,
                               progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr))
-    st = load()
-    names = st.get("names") or {}
+    names = chatinfo()["names"]
     me = my_oid()
     return [chat_row(c, names, me, fetch_names=False) for c in convs]
 
@@ -515,9 +660,9 @@ def cmd_teams(a):
         print(json.dumps(tree, ensure_ascii=False, indent=1))
         return
     for t in tree:
-        print(t["name"])
+        print(clean(t["name"]))
         for ch in t["channels"]:
-            print(f"  {ch['name']}" + ("  (private)" if ch["kind"] == "private" else ""))
+            print(f"  {clean(ch['name'])}" + ("  (private)" if ch["kind"] == "private" else ""))
 
 
 def cmd_chats(a):
@@ -531,7 +676,7 @@ def cmd_chats(a):
     if a.ids:
         for r in rows:
             n = f"{r['n']:>3}" if "n" in r else "   "
-            print(f"{n}  {r['id']}  {r['title']}")
+            print(f"{n}  {clean(r['id'])}  {clean(r['title'])}")
         return
     for r in rows:
         unread = r["unread"]
@@ -541,9 +686,9 @@ def cmd_chats(a):
             badge = f"({unread}{'+' if r.get('unread_capped') else ''})"
         else:
             badge = ""
-        prev = r["preview"].replace("\n", " ")
+        prev = clean(r["preview"]).replace("\n", " ")
         n = f"{r['n']:>3}" if "n" in r else "   "
-        print(f"{n}  {ts(r['time']):19}  {r['title'][:36]:36} {badge:>5}  {prev[:60]!r}")
+        print(f"{n}  {ts(r['time']):19}  {clean(r['title'])[:36]:36} {badge:>5}  {prev[:60]!r}")
 
 
 def people(cid):
@@ -557,8 +702,10 @@ def people(cid):
 
 def build_mentions(cid, text, queries):
     """Replace `@query` in text with Mention spans; returns (html, mentions property list)."""
-    ppl = people(cid)
     content = html.escape(text).replace("\n", "<br>")
+    if not queries:
+        return content, []
+    ppl = people(cid)
     mentions = []
     for q in queries:
         hits = {i: n for i, n in ppl.items() if q.lower() in n.lower()}
@@ -601,7 +748,7 @@ def cmd_members(a):
         return
     print(f"{res['member_count']} members (list may be partial for large chats)")
     for r in res["members"]:
-        print(f"  {r['name'] or '?':40} {r['role'] or '':6} {r['id']}")
+        print(f"  {clean(r['name']) or '?':40} {clean(r['role'] or ''):6} {clean(r['id'])}")
 
 
 def mri_of(x):
@@ -617,14 +764,32 @@ def one_to_one_id(mri):
     return f"19:{a}_{b}@unq.gbl.spaces"
 
 
+PROFILES_TTL = 7 * 86400
+
+
 def profiles(mris):
-    """mri -> display name via the directory (works for anyone in the tenant)."""
+    """mri -> display name via the directory; names are cached for 7 days, only missing/stale are fetched."""
     mris = [m for m in dict.fromkeys(mris) if m.startswith("8:orgid:")]
-    out_ = {}
-    for i in range(0, len(mris), 500):
+    cache = _read_cache(PROFILES_CACHE) or {"names": {}}
+    names = cache.setdefault("names", {})
+    now = time.time()
+    out_, todo = {}, []
+    for m in mris:
+        e = names.get(m)
+        if isinstance(e, dict) and now - e.get("at", 0) < PROFILES_TTL:
+            out_[m] = e.get("name")
+        else:
+            todo.append(m)
+    for i in range(0, len(todo), 500):
         d = mt_call("users/fetchShortProfile?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true"
-                    "&includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true", mris[i:i + 500])
-        out_.update({u["mri"]: u.get("displayName") for u in (d or {}).get("value", []) if u.get("mri")})
+                    "&includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true", todo[i:i + 500])
+        for u in (d or {}).get("value", []):
+            if u.get("mri"):
+                names[u["mri"]] = {"name": u.get("displayName"), "at": now}
+                out_[u["mri"]] = u.get("displayName")
+    if todo:
+        cache["updated_at"] = now
+        _write_cache(PROFILES_CACHE, cache)
     return out_
 
 
@@ -644,8 +809,8 @@ def cmd_people(a):
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
     for r in rows:
-        print(f"{r['name'] or '?':40} {r['email'] or '':36} {r['department'] or ''}")
-        print(f"{'':40} {r['id']}  1:1: {r['chat_id']}")
+        print(f"{clean(r['name']) or '?':40} {clean(r['email'] or ''):36} {clean(r['department'] or '')}")
+        print(f"{'':40} {clean(r['id'])}  1:1: {clean(r['chat_id'])}")
 
 
 def get_presence(who):
@@ -673,7 +838,7 @@ def cmd_presence(a):
     names = profiles([r["id"] for r in rows])
     for r in rows:
         ooo = "  out of office" if r["out_of_office"] else ""
-        print(f"{names.get(r['id']) or r['id']:40} {r['availability'] or '?':14} {r['activity'] or ''}{ooo}")
+        print(f"{clean(names.get(r['id']) or r['id']):40} {clean(r['availability'] or '?'):14} {clean(r['activity'] or '')}{ooo}")
 
 
 def _addr(x):
@@ -715,15 +880,15 @@ def cmd_search(a):
         return
     print(f"{res['total']} matches, showing {len(res['results'])}")
     for r in res["results"]:
-        print(f"[{ts(r['time'])}] {(r['chat'] or '')[:30]:30} {r['from'] or '?'}: {(r['text'] or '').replace(chr(10), ' ')[:90]}")
-        print(f"{'':22}{r['chat_id']}")
+        print(f"[{ts(r['time'])}] {clean(r['chat'])[:30]:30} {clean(r['from']) or '?'}: "
+              f"{clean(r['text']).replace(chr(10), ' ')[:90]}")
+        print(f"{'':22}{clean(r['chat_id'])}")
 
 
 def resolve(sel):
     if ":" in sel:  # a full chat id needs no cache lookup
         return sel
-    st = load()
-    ids = st.get("chats") or []
+    ids = chatinfo()["chats"]
     if sel.isdigit() and int(sel) < len(ids):
         return ids[int(sel)]
     hits = [i for i in ids if sel in i]
@@ -739,25 +904,36 @@ def resolve_write(sel):
     return sel
 
 
-def read_messages(cid, n=10, before=None):
-    """Recent messages (oldest first) in the msg_json shape; `before` pages up from a message id."""
-    msgs = []
-    for m in iter_msgs(cid):
-        if m.get("messagetype") in REAL_TYPES and (before is None or int(m["id"]) < before):
-            msgs.append(m)
-            if len(msgs) >= n:
-                break
-    msgs.reverse()
-    return [msg_json(m, cid) for m in msgs]
+def read_messages(cid, n=10, before=None, refresh=False):
+    """Recent messages (oldest first) in the msg_json shape; falls back to the cached page offline."""
+    try:
+        msgs = []
+        for m in iter_msgs(cid):
+            if m.get("messagetype") in REAL_TYPES and (before is None or int(m["id"]) < before):
+                msgs.append(m)
+                if len(msgs) >= n:
+                    break
+        msgs.reverse()
+        rows = [msg_json(m, cid) for m in msgs]
+    except TeamsError as e:
+        cached = cached_messages(cid) if not refresh and before is None else None
+        if cached is None:
+            raise
+        age = time.strftime("%Y-%m-%d %H:%M", time.localtime(cached.get("fetched_at", 0)))
+        print(f"warning: {clean(e)}; showing cache from {age}", file=sys.stderr)
+        return cached["messages"][-n:]
+    if before is None and rows:
+        cache_messages(cid, rows)
+    return rows
 
 
 def cmd_read(a):
-    rows = read_messages(resolve(a.chat), a.n, int(a.before) if a.before else None)
+    rows = read_messages(resolve(a.chat), a.n, int(a.before) if a.before else None, a.refresh)
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
     for r in rows:
-        print(f"[{ts(r['time'])}] {r['from'] or '?'}: {r['text'] or ('(deleted)' if r['deleted'] else '')}")
+        print(f"[{ts(r['time'])}] {clean(r['from']) or '?'}: {clean(r['text']) or ('(deleted)' if r['deleted'] else '')}")
 
 
 def prepare_send(cid, text="", reply_to=None, mentions=(), image=None):
@@ -802,7 +978,7 @@ def send_prepared(cid, p, text=""):
 
 def cmd_send(a):
     cid = resolve_write(a.chat)
-    title = load().get("titles", {}).get(cid, cid)
+    title = chatinfo()["titles"].get(cid, cid)
     text = a.text or ""
     p = prepare_send(cid, text, a.reply_to, a.mention or [], a.image)
     if not a.yes:
@@ -810,14 +986,14 @@ def cmd_send(a):
         if a.json:
             print(json.dumps({"sent": False, "dry_run": True, "chat_id": cid, "text": text, **extra}, ensure_ascii=False))
             return
-        notes = "".join(f"\n  {k}: {v}" for k, v in extra.items() if v)
-        print(f"DRY RUN. Would send to {title!r}:\n{text}{notes}\n\n(add --yes to really send)")
+        notes = "".join(f"\n  {k}: {clean(v)}" for k, v in extra.items() if v)
+        print(f"DRY RUN. Would send to {clean(title)!r}:\n{clean(text)}{notes}\n\n(add --yes to really send)")
         return
     res = send_prepared(cid, p, text)
     if a.json:
         print(json.dumps({"sent": True, **res}, ensure_ascii=False))
         return
-    print(f"sent to {title!r}", "" if DEBUG else "", res if DEBUG else "")
+    print(f"sent to {clean(title)!r}", "" if DEBUG else "", res if DEBUG else "")
 
 
 AMS = "https://eu-api.asm.skype.com"
@@ -846,20 +1022,27 @@ def upload_image(cid, path):
 
 def download_attachments(cid, mid, out="."):
     """Save the image attachments of one message; SharePoint files come back as urls."""
+    mid = os.path.basename(mid)
     m = next((m for m in iter_msgs(cid, max_pages=10) if m.get("id") == mid), None)
     if not m:
         raise TeamsError(f"message {mid} not found in recent history of this chat")
     os.makedirs(out, exist_ok=True)
     saved = []
     for i, att in enumerate(msg_json(m, cid)["attachments"]):
-        if att["kind"] == "image" and "asm.skype" in (att.get("url") or ""):
+        if att["kind"] == "image" and ams_url_ok(att.get("url")):
             req = urllib.request.Request(att["url"], headers={"User-Agent": UA, **ams_headers()})
             with urllib.request.urlopen(req, timeout=60) as r:
                 body = r.read()
                 ext = {"image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}.get(r.headers.get("Content-Type"), ".jpg")
             path = os.path.join(out, f"{mid}_{i}{ext}")
-            open(path, "wb").write(body)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
             saved.append({"kind": "image", "path": path})
+        elif att["kind"] == "image":
+            saved.append({"kind": "image", "url": att.get("url"),
+                          "note": "not an AMS image: open the url in a browser"})
         elif att["kind"] == "file":
             saved.append({"kind": "file", "name": att.get("name"), "url": att.get("url"), "note": "SharePoint file: open the url in a browser (not downloadable via this API)"})
     return saved
@@ -871,7 +1054,10 @@ def cmd_download(a):
         print(json.dumps(saved, ensure_ascii=False, indent=1))
     else:
         for x in saved:
-            print(x.get("path") or f"{x['name']}  {x['url']}")
+            if x.get("path"):
+                print(clean(x["path"]))
+            else:
+                print(f"{clean(x.get('name'))}  {clean(x.get('url'))}".strip())
 
 
 def self_name(cid):
@@ -887,19 +1073,19 @@ def msg_path(cid, mid, tail=""):
 def write_cmd(a, what, fn):
     """Dry run unless --yes; JSON or text result."""
     cid = resolve_write(a.chat)
-    title = load().get("titles", {}).get(cid, cid)
+    title = chatinfo()["titles"].get(cid, cid)
     if not a.yes:
         if a.json:
             print(json.dumps({"done": False, "dry_run": True, "action": what, "chat_id": cid,
                               "id": getattr(a, "id", None)}, ensure_ascii=False))
         else:
-            print(f"DRY RUN. Would {what} in {title!r} (add --yes to do it)")
+            print(f"DRY RUN. Would {clean(what)} in {clean(title)!r} (add --yes to do it)")
         return
     fn(cid)
     if a.json:
         print(json.dumps({"done": True, "action": what, "chat_id": cid, "id": getattr(a, "id", None)}, ensure_ascii=False))
     else:
-        print(f"done: {what} in {title!r}")
+        print(f"done: {clean(what)} in {clean(title)!r}")
 
 
 def edit_message(cid, mid, text):
@@ -948,6 +1134,27 @@ def cmd_mark_read(a):
     def run(cid):
         a.id = mark_read(cid, a.id)
     write_cmd(a, f"mark read up to {a.id or 'newest'}", run)
+
+
+def clear_cache():
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+
+def cmd_cache(a):
+    clear_cache()
+    print(f"cache cleared: {CACHE_DIR}")
+
+
+def cmd_logout(a):
+    """Remove tokens (keyring and the state fallback) and the local cache."""
+    for k in SECRET_KEYS:
+        keyring_clear(k)
+    st = load()
+    for k in list(SECRET_KEYS) + ["access_exp", "skype_exp", "presence_token_exp", "substrate_token_exp"]:
+        st.pop(k, None)
+    save(st)
+    clear_cache()
+    print("logged out; tokens and cache removed")
 
 
 TROUTER_TTL = 86400
@@ -1008,6 +1215,20 @@ def decode_event(req):
     return obj
 
 
+def dump_event(ev):
+    """TEAMS_DUMP=<path>: append raw Trouter events (full message text) with 0600 perms."""
+    path = os.environ.get("TEAMS_DUMP")
+    if not path:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False)[:3000] + "\n")
+    except OSError as e:
+        print(f"warning: cannot write TEAMS_DUMP: {e}", file=sys.stderr)
+
+
 def out(obj):
     print(json.dumps(obj, ensure_ascii=False), flush=True)
 
@@ -1044,14 +1265,15 @@ def emit(res, kind, want, seen):
     if mid in seen:
         return None
     seen.add(mid)
-    st = load()
-    title = st.get("titles", {}).get(cid) or st.get("names", {}).get(cid) or cid[-24:]
+    info = chatinfo()
+    title = info["titles"].get(cid) or info["names"].get(cid) or cid[-24:]
     if mt not in REAL_TYPES:
         return {**base, "chat": title, "event": "system"}
     if props.get("deletetime"):
         event = "message_deleted"
     else:
         event = "message" if kind == "NewMessage" else "message_updated"
+    update_cached_message(cid, base)
     return {**base, "chat": title, "event": event}
 
 
@@ -1064,11 +1286,11 @@ def cli_event(as_json):
         if as_json:
             out(ev)
         elif kind == "status":
-            print(f"[{ev['state']}] " + " ".join(f"{k}={v}" for k, v in ev.items() if k not in ("event", "state")),
+            print(f"[{clean(ev['state'])}] " + " ".join(f"{k}={clean(v)}" for k, v in ev.items() if k not in ("event", "state")),
                   file=sys.stderr, flush=True)
         elif kind in marks:
-            text = ev["text"] or f"<{ev['type']}>"
-            print(f"[{ts(ev['time'])}] {ev['chat']} | {ev['from'] or '?'}: {text}{marks[kind]}", flush=True)
+            text = clean(ev["text"]) or f"<{clean(ev['type'])}>"
+            print(f"[{ts(ev['time'])}] {clean(ev['chat'])} | {clean(ev['from']) or '?'}: {text}{marks[kind]}", flush=True)
     return on_event
 
 
@@ -1138,8 +1360,7 @@ async def watch_once(want, on_event, seen, horizons):
                     elif ev.get("resourceType") == "ConversationUpdate":
                         e = emit_read(ev["resource"], want, horizons)
                     elif os.environ.get("TEAMS_DUMP"):
-                        with open(os.environ["TEAMS_DUMP"], "a") as f:
-                            f.write(json.dumps(ev, ensure_ascii=False)[:3000] + "\n")
+                        dump_event(ev)
                         e = None
                     else:
                         e = None
@@ -1181,7 +1402,7 @@ def main():
     ap.add_argument("--debug", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     lg = sub.add_parser("login")
-    lg.add_argument("--url", help="redirect URL pasted after browser sign-in")
+    lg.add_argument("--url", help="redirect URL pasted after browser sign-in ('-' reads it from stdin)")
     lg.set_defaults(fn=cmd_login)
     c = sub.add_parser("chats")
     c.add_argument("--json", action="store_true")
@@ -1197,6 +1418,7 @@ def main():
     r.add_argument("chat")
     r.add_argument("-n", type=int, default=20)
     r.add_argument("--before", help="only messages older than this message id (for paging up)")
+    r.add_argument("--refresh", action="store_true", help="ignore the cached page and fetch from the server")
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_read)
     mb = sub.add_parser("members", help="participants of a chat (partial for large chats)")
@@ -1250,15 +1472,21 @@ def main():
         sp.add_argument("--json", action="store_true")
         sp.add_argument("--yes", action="store_true", help="really do it (default is a dry run)")
         sp.set_defaults(fn=fn)
+    lo = sub.add_parser("logout", help="remove stored tokens and the local cache")
+    lo.set_defaults(fn=cmd_logout)
+    ca = sub.add_parser("cache", help="local cache maintenance")
+    ca.add_argument("action", nargs="?", default="clear", choices=["clear"])
+    ca.set_defaults(fn=cmd_cache)
     a = ap.parse_args()
     DEBUG = a.debug
     try:
         a.fn(a)
     except TeamsError as e:
+        msg = clean(str(e))
         if getattr(a, "json", False):
-            print(json.dumps({"error": str(e)}, ensure_ascii=False))
+            print(json.dumps({"error": msg}, ensure_ascii=False))
             sys.exit(1)
-        sys.exit(str(e))
+        sys.exit(msg)
 
 
 if __name__ == "__main__":

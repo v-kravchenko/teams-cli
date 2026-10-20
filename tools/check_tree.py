@@ -13,7 +13,7 @@ tc = importlib.util.module_from_spec(spec)
 sys.modules["teams_cli"] = tc
 spec.loader.exec_module(tc)
 
-convs = json.load(open(tc.CONV_CACHE))["conversations"]
+convs = json.load(open(tc.CONV_CACHE, encoding="utf-8"))["conversations"]
 tree = tc.channel_tree(convs)
 channels = [ch for t in tree for ch in t["channels"]]
 ids = [ch["id"] for ch in channels]

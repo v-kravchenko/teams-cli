@@ -1,0 +1,46 @@
+[
+  {
+    "id": "1700000001000",
+    "conversationid": "19:aaa_bbb@unq.gbl.spaces",
+    "messagetype": "Text",
+    "content": "hello &amp; bye",
+    "from": "https://api.spaces.skype.com/v1/users/8:orgid:aaa",
+    "imdisplayname": "Alice",
+    "composetime": "2024-01-01T10:00:00.000Z"
+  },
+  {
+    "id": "1700000002000",
+    "conversationid": "19:aaa_bbb@unq.gbl.spaces",
+    "messagetype": "RichText/Html",
+    "content": "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" itemid=\"1700000001000\"><strong itemprop=\"mri\" itemid=\"8:orgid:aaa\">Alice</strong><span itemprop=\"time\" itemid=\"1700000001000\"></span><p itemprop=\"preview\">hello &amp; bye</p></blockquote><p>reply <img src=\"https://eu-api.asm.skype.com/v1/objects/oid/views/imgo\" itemtype=\"http://schema.skype.com/AMSImage\" itemscope=\"png\" alt=\"pic.png\"> <img src=\"https://eu-api.asm.skype.com/v1/objects/emoji/views/imgo\" itemtype=\"http://schema.skype.com/Emoji\" alt=\"smile\"></p>",
+    "from": "https://api.spaces.skype.com/v1/users/8:orgid:bbb",
+    "imdisplayname": "Bob",
+    "composetime": "2024-01-01T10:01:00.000Z",
+    "rootMessageId": "1700000001000",
+    "properties": {
+      "edittime": "2024-01-01T10:05:00.000Z",
+      "files": [{"fileName": "doc.pdf", "objectUrl": "https://sharepoint/doc"}],
+      "cards": [{"content": {"title": "Card"}, "contentType": "application/vnd.card"}],
+      "emotions": [{"key": "like", "users": [{"mri": "8:orgid:aaa"}, {"mri": "8:orgid:ccc"}]}]
+    }
+  },
+  {
+    "id": "1700000003000",
+    "conversationid": "19:aaa_bbb@unq.gbl.spaces",
+    "messagetype": "Text",
+    "content": "",
+    "from": "https://api.spaces.skype.com/v1/users/8:orgid:aaa",
+    "imdisplayname": "Alice",
+    "composetime": "2024-01-01T10:02:00.000Z",
+    "properties": {"deletetime": "2024-01-01T10:06:00.000Z"}
+  },
+  {
+    "id": "1700000004000",
+    "conversationid": "19:aaa_bbb@unq.gbl.spaces",
+    "messagetype": "Text",
+    "content": "root message",
+    "from": "https://api.spaces.skype.com/v1/users/8:orgid:bbb",
+    "imdisplayname": "Bob",
+    "composetime": "2024-01-01T10:03:00.000Z"
+  }
+]

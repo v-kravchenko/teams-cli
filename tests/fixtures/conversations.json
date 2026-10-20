@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "fetched_at": 1700000000,
+  "conversations": [
+    {
+      "id": "48:notes",
+      "lastMessage": {
+        "id": "1700000005000",
+        "composetime": "2024-01-01T12:00:00.000Z",
+        "imdisplayname": "Me",
+        "content": "note to self",
+        "messagetype": "Text",
+        "from": "https://api.spaces.skype.com/v1/users/ME"
+      }
+    },
+    {
+      "id": "48:notifications",
+      "lastMessage": {"id": "1700000005001", "content": "noise"}
+    },
+    {
+      "id": "19:aaa_bbb@unq.gbl.spaces",
+      "threadProperties": {},
+      "lastMessage": {
+        "id": "1700000005002",
+        "composetime": "2024-01-01T12:01:00.000Z",
+        "imdisplayname": "Alice",
+        "content": "hi there",
+        "messagetype": "Text",
+        "from": "https://api.spaces.skype.com/v1/users/8:orgid:aaa"
+      }
+    },
+    {
+      "id": "19:group@thread.v2",
+      "threadProperties": {"threadType": "chat"},
+      "lastMessage": {
+        "id": "1700000005003",
+        "composetime": "2024-01-01T12:02:00.000Z",
+        "imdisplayname": "Bob",
+        "content": "",
+        "messagetype": "Event/Call",
+        "from": "https://api.spaces.skype.com/v1/users/8:orgid:bbb"
+      }
+    },
+    {
+      "id": "19:general-a@thread.tacv2",
+      "threadProperties": {
+        "groupId": "g1",
+        "spaceType": "standard",
+        "topic": "General",
+        "spaceThreadTopic": "Team A"
+      },
+      "lastMessage": {
+        "id": "1700000005004",
+        "composetime": "2024-01-01T12:03:00.000Z",
+        "imdisplayname": "Carol",
+        "content": "general news",
+        "messagetype": "Text",
+        "from": "https://api.spaces.skype.com/v1/users/8:orgid:ccc"
+      },
+      "properties": {"consumptionhorizon": "1700000005003;1700000005100;1700000005100"}
+    },
+    {
+      "id": "19:news-a@thread.tacv2",
+      "threadProperties": {"groupId": "g1", "spaceId": "19:general-a@thread.tacv2", "topic": "News"},
+      "lastMessage": {
+        "id": "1700000005005",
+        "composetime": "2024-01-01T12:04:00.000Z",
+        "imdisplayname": "Carol",
+        "content": "release",
+        "messagetype": "Text",
+        "from": "https://api.spaces.skype.com/v1/users/8:orgid:ccc"
+      }
+    },
+    {
+      "id": "19:secret-a@thread.tacv2",
+      "threadProperties": {"groupId": "g1", "spaceThreadTopic": "Secret", "topic": "Secret"},
+      "lastMessage": {
+        "id": "1700000005006",
+        "composetime": "2024-01-01T12:05:00.000Z",
+        "imdisplayname": "Dave",
+        "content": "psst",
+        "messagetype": "Text",
+        "from": "https://api.spaces.skype.com/v1/users/8:orgid:ddd"
+      }
+    },
+    {
+      "id": "19:general-b@thread.tacv2",
+      "threadProperties": {
+        "groupId": "g2",
+        "spaceType": "standard",
+        "topic": "General",
+        "spaceThreadTopic": "Team B"
+      },
+      "lastMessage": {
+        "id": "1700000005007",
+        "composetime": "2024-01-01T12:06:00.000Z",
+        "imdisplayname": "Eve",
+        "content": "hello B",
+        "messagetype": "Text",
+        "from": "https://api.spaces.skype.com/v1/users/8:orgid:eee"
+      }
+    }
+  ]
+}
