@@ -271,6 +271,23 @@ def msgs_of(cid, n=10):
     return d.get("messages", [])
 
 
+REAL_TYPES = ("Text", "RichText/Html", "RichText")
+
+
+def iter_msgs(cid, page=50, max_pages=40):
+    """Messages newest first, following backwardLink page by page."""
+    path = (f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/messages"
+            f"?startTime=1&pageSize={page}&view=msnp24Equivalent&targetType={TARGETS}")
+    for _ in range(max_pages):
+        d = chat_get(path)
+        yield from sorted(d.get("messages", []), key=lambda m: int(m.get("id") or 0), reverse=True)
+        link = (d.get("_metadata") or {}).get("backwardLink")
+        if not link or not d.get("messages"):
+            return
+        u = urllib.parse.urlparse(link)
+        path = u.path + "?" + u.query
+
+
 def peer_name(cid, names):
     """Name of the other person in a 1:1 chat (cached in state)."""
     if cid in names:
@@ -337,8 +354,14 @@ def resolve(sel):
 
 def cmd_read(a):
     cid = resolve(a.chat)
-    msgs = [m for m in msgs_of(cid, max(a.n * 3, 30)) if m.get("messagetype") in ("Text", "RichText/Html", "RichText")]
-    msgs = sorted(msgs, key=lambda m: m.get("composetime", ""))[-a.n:]
+    before = int(a.before) if a.before else None
+    msgs = []
+    for m in iter_msgs(cid):
+        if m.get("messagetype") in REAL_TYPES and (before is None or int(m["id"]) < before):
+            msgs.append(m)
+            if len(msgs) >= a.n:
+                break
+    msgs.reverse()
     if a.json:
         print(json.dumps([msg_json(m, cid) for m in msgs], ensure_ascii=False, indent=1))
         return
@@ -529,6 +552,7 @@ def main():
     r = sub.add_parser("read")
     r.add_argument("chat")
     r.add_argument("-n", type=int, default=20)
+    r.add_argument("--before", help="only messages older than this message id (for paging up)")
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_read)
     w = sub.add_parser("watch", help="live incoming messages via Trouter websocket")
