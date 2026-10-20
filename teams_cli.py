@@ -235,6 +235,32 @@ def msg_text(m):
     return text_of(m.get("content"), m.get("properties"))
 
 
+def msg_json(m, cid=None):
+    """One message in the stable JSON shape shared by read/watch/send."""
+    props = m.get("properties") or {}
+    content = m.get("content") or ""
+    att = [{"kind": "image", "url": u} for u in re.findall(r'<img[^>]*AMSImage[^>]*src="([^"]+)"', content)]
+    att += [{"kind": "image", "url": u} for u in re.findall(r'<img[^>]*src="([^"]+)"[^>]*AMSImage', content)]
+    att += [{"kind": "file", "name": f.get("fileName") or f.get("title"), "url": f.get("objectUrl") or f.get("fileInfo", {}).get("fileUrl")}
+            for f in _prop_list(props, "files") if isinstance(f, dict)]
+    att += [{"kind": "card", "title": (c.get("content") or {}).get("title") if isinstance(c, dict) else None}
+            for c in _prop_list(props, "cards")]
+    reactions = [{"key": e.get("key"), "count": len(e.get("users") or []),
+                  "users": [u.get("mri") for u in e.get("users") or []]} for e in _prop_list(props, "emotions")]
+    reply = None
+    q = _prop_list(props, "qtdMsgs")
+    if q and isinstance(q[0], dict):
+        reply = {"id": str(q[0].get("messageId")), "from_id": q[0].get("sender")}
+        pv = re.search(r'itemprop="preview">(.*?)</p>', content, re.S)
+        reply["preview"] = html.unescape(re.sub(r"<[^>]+>", "", pv.group(1))) if pv else None
+    frm = m.get("from") or ""
+    return {"id": m.get("id"), "chat_id": cid or m.get("conversationid"), "time": m.get("composetime"),
+            "from": m.get("imdisplayname"), "from_id": frm.rsplit("/", 1)[-1] or None,
+            "type": m.get("messagetype"), "text": text_of(content), "html": content,
+            "attachments": att, "reactions": reactions, "reply_to": reply,
+            "edited": bool(props.get("edittime")), "deleted": bool(props.get("deletetime"))}
+
+
 def ts(s):
     return (s or "")[:19].replace("T", " ")
 
@@ -257,6 +283,16 @@ def peer_name(cid, names):
     return None
 
 
+def chat_kind(c):
+    i = c["id"]
+    if i == "48:notes":
+        return "self"
+    tp = c.get("threadProperties") or {}
+    if tp.get("threadType") == "space" or tp.get("spaceThreadTopic"):
+        return "channel"
+    return "1:1" if i.endswith("@unq.gbl.spaces") else "group"
+
+
 def cmd_chats(a):
     d = chat_get("/v1/users/ME/conversations?startTime=0&pageSize=50&view=msnp24Equivalent&targetType=" + TARGETS)
     convs = [c for c in d.get("conversations", []) if c["id"] not in ("48:notifications", "48:threads")]
@@ -277,7 +313,7 @@ def cmd_chats(a):
             title = f"[1:1] {nm}" if nm else "[chat]"
         text = msg_text(last)
         preview = f"{last.get('imdisplayname') or '?'}: {text}" if text else f"{last.get('imdisplayname') or '?'}: <{last.get('messagetype', '?')}>"
-        rows.append({"n": i, "id": c["id"], "title": title, "time": last.get("composetime"),
+        rows.append({"n": i, "id": c["id"], "kind": chat_kind(c), "title": title, "time": last.get("composetime"),
                      "from": last.get("imdisplayname"), "preview": preview})
         st.setdefault("titles", {})[c["id"]] = title
     save(st)
@@ -304,9 +340,7 @@ def cmd_read(a):
     msgs = [m for m in msgs_of(cid, max(a.n * 3, 30)) if m.get("messagetype") in ("Text", "RichText/Html", "RichText")]
     msgs = sorted(msgs, key=lambda m: m.get("composetime", ""))[-a.n:]
     if a.json:
-        print(json.dumps([{"id": m.get("id"), "time": m.get("composetime"), "from": m.get("imdisplayname"),
-                           "text": msg_text(m), "type": m.get("messagetype")} for m in msgs],
-                         ensure_ascii=False, indent=1))
+        print(json.dumps([msg_json(m, cid) for m in msgs], ensure_ascii=False, indent=1))
         return
     for m in msgs:
         print(f"[{ts(m.get('composetime'))}] {m.get('imdisplayname') or '?'}: {msg_text(m)}")
@@ -317,6 +351,9 @@ def cmd_send(a):
     title = load().get("titles", {}).get(cid, cid)
     text = a.text
     if not a.yes:
+        if a.json:
+            print(json.dumps({"sent": False, "dry_run": True, "chat_id": cid, "text": text}, ensure_ascii=False))
+            return
         print(f"DRY RUN. Would send to {title!r}:\n{text}\n\n(add --yes to really send)")
         return
     me = my_oid()
@@ -326,6 +363,9 @@ def cmd_send(a):
             "content": html.escape(text).replace("\n", "<br>"),
             "messagetype": "RichText/Html", "contenttype": "text", "imdisplayname": self_name}
     r = chat_call("POST", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/messages", body)
+    if a.json:
+        print(json.dumps({"sent": True, "chat_id": cid, "client_id": body["clientmessageid"], "text": text}, ensure_ascii=False))
+        return
     print(f"sent to {title!r}", "" if DEBUG else "", (r or {}) if DEBUG else "")
 
 
@@ -399,8 +439,7 @@ def emit(res, kind, want, as_json, seen):
     text = msg_text(res) or f"<{res.get('messagetype', '?')}>"
     who = res.get("imdisplayname") or "?"
     if as_json:
-        print(json.dumps({"time": res.get("composetime"), "chat_id": cid, "chat": title, "from": who,
-                          "text": text, "type": res.get("messagetype"), "event": kind}, ensure_ascii=False), flush=True)
+        print(json.dumps({**msg_json(res, cid), "chat": title, "event": kind}, ensure_ascii=False), flush=True)
     else:
         mark = " (edited)" if kind == "MessageUpdate" else ""
         print(f"[{ts(res.get('composetime'))}] {title} | {who}: {text}{mark}", flush=True)
@@ -499,11 +538,18 @@ def main():
     sd = sub.add_parser("send")
     sd.add_argument("chat")
     sd.add_argument("text")
+    sd.add_argument("--json", action="store_true")
     sd.add_argument("--yes", action="store_true", help="really send (default is a dry run)")
     sd.set_defaults(fn=cmd_send)
     a = ap.parse_args()
     DEBUG = a.debug
-    a.fn(a)
+    try:
+        a.fn(a)
+    except SystemExit as e:
+        if getattr(a, "json", False) and isinstance(e.code, str):
+            print(json.dumps({"error": e.code}, ensure_ascii=False))
+            sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":
