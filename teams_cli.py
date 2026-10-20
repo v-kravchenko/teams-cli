@@ -456,12 +456,6 @@ def cmd_send(a):
     text = a.text or ""
     if not text and not a.image:
         sys.exit("nothing to send: give text and/or --image")
-    if not a.yes:
-        if a.json:
-            print(json.dumps({"sent": False, "dry_run": True, "chat_id": cid, "text": text}, ensure_ascii=False))
-            return
-        print(f"DRY RUN. Would send to {title!r}:\n{text}\n\n(add --yes to really send)")
-        return
     content, mentions = build_mentions(cid, text, a.mention or [])
     if a.reply_to:
         q = next((m for m in iter_msgs(cid, max_pages=5) if m.get("id") == a.reply_to), None)
@@ -471,6 +465,19 @@ def cmd_send(a):
         content = (f'<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="{q["id"]}">'
                    f'<strong itemprop="mri" itemid="{(q.get("from") or "").rsplit("/", 1)[-1]}">{html.escape(q.get("imdisplayname") or "")}</strong>'
                    f'<span itemprop="time" itemid="{q["id"]}"></span><p itemprop="preview">{preview}</p></blockquote><p>{content}</p>')
+    if a.image:
+        if os.path.splitext(a.image)[1].lower() not in IMG_TYPES:
+            sys.exit(f"unsupported image type; supported: {', '.join(IMG_TYPES)}")
+        if not os.path.isfile(a.image):
+            sys.exit(f"no such file: {a.image}")
+    if not a.yes:
+        extra = {"reply_to": a.reply_to, "mentions": [m["displayName"] for m in mentions], "image": a.image}
+        if a.json:
+            print(json.dumps({"sent": False, "dry_run": True, "chat_id": cid, "text": text, **extra}, ensure_ascii=False))
+            return
+        notes = "".join(f"\n  {k}: {v}" for k, v in extra.items() if v)
+        print(f"DRY RUN. Would send to {title!r}:\n{text}{notes}\n\n(add --yes to really send)")
+        return
     if a.image:
         _, tag = upload_image(cid, a.image)
         if a.reply_to:
