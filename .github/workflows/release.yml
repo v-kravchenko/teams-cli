@@ -16,6 +16,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 -m unittest discover -s tests -v
-      - run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes "teams_cli.py#teams"
+      - run: |
+          cp teams_cli.py teams
+          chmod +x teams
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes teams
         env:
           GH_TOKEN: ${{ github.token }}
