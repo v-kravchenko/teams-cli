@@ -260,7 +260,8 @@ def msg_json(m, cid=None):
     return {"id": m.get("id"), "chat_id": cid or m.get("conversationid"), "time": m.get("composetime"),
             "from": m.get("imdisplayname"), "from_id": frm.rsplit("/", 1)[-1] or None,
             "type": m.get("messagetype"), "text": text_of(content), "html": content,
-            "attachments": att, "reactions": reactions, "reply_to": reply,
+            "attachments": att, "mentions": [{"id": x.get("mri"), "name": x.get("displayName")} for x in _prop_list(props, "mentions") if isinstance(x, dict)],
+            "reactions": reactions, "reply_to": reply,
             "edited": bool(props.get("edittime")), "deleted": bool(props.get("deletetime"))}
 
 
@@ -371,6 +372,37 @@ def cmd_chats(a):
         print(f"{r['n']:>3}  {ts(r['time']):19}  {r['title'][:36]:36} {badge:>5}  {prev[:60]!r}")
 
 
+def people(cid):
+    """id -> display name for everyone seen speaking in the chat (recent history)."""
+    out_ = {}
+    for i, m in enumerate(iter_msgs(cid, max_pages=3)):
+        if m.get("imdisplayname"):
+            out_.setdefault((m.get("from") or "").rsplit("/", 1)[-1], m["imdisplayname"])
+    return out_
+
+
+def build_mentions(cid, text, queries):
+    """Replace `@query` in text with Mention spans; returns (html, mentions property list)."""
+    ppl = people(cid)
+    content = html.escape(text).replace("\n", "<br>")
+    mentions = []
+    for q in queries:
+        hits = {i: n for i, n in ppl.items() if q.lower() in n.lower()}
+        if len(hits) != 1:
+            sys.exit(f"mention {q!r}: " + ("no one with that name seen in this chat" if not hits
+                                           else "ambiguous: " + ", ".join(hits.values())))
+        (mri, name), = hits.items()
+        token = "@" + html.escape(q)
+        pat = re.compile(re.escape(token), re.I)
+        if not pat.search(content):
+            sys.exit(f"mention {q!r}: write @{q} in the text where the mention should go")
+        idx = len(mentions)
+        content = pat.sub(lambda _: f'<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="{idx}">{html.escape(name)}</span>', content, count=1)
+        mentions.append({"@type": "http://schema.skype.com/Mention", "itemid": idx, "mri": mri,
+                         "mentionType": "person", "displayName": name})
+    return content, mentions
+
+
 def cmd_members(a):
     cid = resolve(a.chat)
     d = chat_get(f"/v1/threads/{urllib.parse.quote(cid, safe='')}?view=msnp24Equivalent")
@@ -428,7 +460,7 @@ def cmd_send(a):
             return
         print(f"DRY RUN. Would send to {title!r}:\n{text}\n\n(add --yes to really send)")
         return
-    content = html.escape(text).replace("\n", "<br>")
+    content, mentions = build_mentions(cid, text, a.mention or [])
     if a.reply_to:
         q = next((m for m in iter_msgs(cid, max_pages=5) if m.get("id") == a.reply_to), None)
         if not q:
@@ -440,6 +472,8 @@ def cmd_send(a):
     body = {"clientmessageid": str(int(time.time() * 1000)),
             "content": content,
             "messagetype": "RichText/Html", "contenttype": "text", "imdisplayname": self_name(cid)}
+    if mentions:
+        body["properties"] = {"mentions": json.dumps(mentions, ensure_ascii=False)}
     r = chat_call("POST", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/messages", body)
     if a.json:
         print(json.dumps({"sent": True, "chat_id": cid, "id": str((r or {}).get("OriginalArrivalTime") or "") or None, "client_id": body["clientmessageid"], "text": text}, ensure_ascii=False))
@@ -742,6 +776,8 @@ def main():
     sd = sub.add_parser("send")
     sd.add_argument("chat")
     sd.add_argument("text")
+    sd.add_argument("--mention", action="append", metavar="NAME",
+                    help="part of a name seen in the chat; put @NAME in the text (repeatable)")
     sd.add_argument("--reply-to", metavar="ID", help="quote this message id")
     sd.add_argument("--json", action="store_true")
     sd.add_argument("--yes", action="store_true", help="really send (default is a dry run)")
