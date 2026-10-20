@@ -60,6 +60,13 @@ Claude Code) use `login --url '<copied url>'`. The one-time code in that URL exp
 - `send` is a dry run unless `--yes` is given.
 - `watch` registers as an extra Teams endpoint (like another device); it sends no activity or read receipts.
 
+## Limits
+
+Chat writes (`send`, `edit`, `delete`, `react`, `mark-read`) are rate-limited to **3 calls per 5 seconds** per
+account; going faster returns HTTP 429 `API calls quota exceeded! 3Per05Secs`. There is no throttling in the CLI, so
+a loop over many writes needs its own pause (~2 s) and a retry on 429. Deleting messages is a soft delete; the chat
+keeps showing `(deleted)` in place of the text.
+
 ## Output
 
 Plain text by default; `--json` for scripts (`chats` and `read` print one JSON array, `watch` prints one object per
