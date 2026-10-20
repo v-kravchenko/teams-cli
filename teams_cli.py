@@ -227,6 +227,8 @@ def text_of(content, props=None):
             if isinstance(c, dict) else "\n[картка]"
     for e in _prop_list(props, "emotions"):
         n = len(e.get("users") or [])
+        if not n:
+            continue
         s += f"\n  ↳ {e.get('key')}×{n}"
     return s.strip()
 
@@ -246,7 +248,7 @@ def msg_json(m, cid=None):
     att += [{"kind": "card", "title": (c.get("content") or {}).get("title") if isinstance(c, dict) else None}
             for c in _prop_list(props, "cards")]
     reactions = [{"key": e.get("key"), "count": len(e.get("users") or []),
-                  "users": [u.get("mri") for u in e.get("users") or []]} for e in _prop_list(props, "emotions")]
+                  "users": [u.get("mri") for u in e.get("users") or []]} for e in _prop_list(props, "emotions") if e.get("users")]
     reply = None
     q = _prop_list(props, "qtdMsgs")
     if q and isinstance(q[0], dict):
@@ -412,7 +414,7 @@ def cmd_read(a):
         print(json.dumps([msg_json(m, cid) for m in msgs], ensure_ascii=False, indent=1))
         return
     for m in msgs:
-        print(f"[{ts(m.get('composetime'))}] {m.get('imdisplayname') or '?'}: {msg_text(m)}")
+        print(f"[{ts(m.get('composetime'))}] {m.get('imdisplayname') or '?'}: {msg_text(m) or ('(deleted)' if (m.get('properties') or {}).get('deletetime') else '')}")
 
 
 def cmd_send(a):
@@ -433,9 +435,71 @@ def cmd_send(a):
             "messagetype": "RichText/Html", "contenttype": "text", "imdisplayname": self_name}
     r = chat_call("POST", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/messages", body)
     if a.json:
-        print(json.dumps({"sent": True, "chat_id": cid, "client_id": body["clientmessageid"], "text": text}, ensure_ascii=False))
+        print(json.dumps({"sent": True, "chat_id": cid, "id": str((r or {}).get("OriginalArrivalTime") or "") or None, "client_id": body["clientmessageid"], "text": text}, ensure_ascii=False))
         return
     print(f"sent to {title!r}", "" if DEBUG else "", (r or {}) if DEBUG else "")
+
+
+def self_name(cid):
+    me = my_oid()
+    return next((m["imdisplayname"] for m in msgs_of(cid, 30)
+                 if m.get("imdisplayname") and me in (m.get("from") or "")), "")
+
+
+def msg_path(cid, mid, tail=""):
+    return f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/messages/{mid}{tail}"
+
+
+def write_cmd(a, what, fn):
+    """Dry run unless --yes; JSON or text result."""
+    cid = resolve(a.chat)
+    title = load().get("titles", {}).get(cid, cid)
+    if not a.yes:
+        if a.json:
+            print(json.dumps({"done": False, "dry_run": True, "action": what, "chat_id": cid,
+                              "id": getattr(a, "id", None)}, ensure_ascii=False))
+        else:
+            print(f"DRY RUN. Would {what} in {title!r} (add --yes to do it)")
+        return
+    fn(cid)
+    if a.json:
+        print(json.dumps({"done": True, "action": what, "chat_id": cid, "id": getattr(a, "id", None)}, ensure_ascii=False))
+    else:
+        print(f"done: {what} in {title!r}")
+
+
+def cmd_edit(a):
+    def run(cid):
+        body = {"content": html.escape(a.text).replace("\n", "<br>"), "messagetype": "RichText/Html",
+                "contenttype": "text", "imdisplayname": self_name(cid)}
+        chat_call("PUT", msg_path(cid, a.id), body)
+    write_cmd(a, f"edit message {a.id} -> {a.text!r}", run)
+
+
+def cmd_delete(a):
+    write_cmd(a, f"delete message {a.id}", lambda cid: chat_call("DELETE", msg_path(cid, a.id, "?behavior=softDelete")))
+
+
+def cmd_react(a):
+    def run(cid):
+        path = msg_path(cid, a.id, "/properties?name=emotions")
+        if a.remove:
+            chat_call("DELETE", path, {"emotions": {"key": a.emoji}})
+        else:
+            chat_call("PUT", path, {"emotions": {"key": a.emoji, "value": int(time.time() * 1000)}})
+    write_cmd(a, f"{'remove' if a.remove else 'add'} reaction {a.emoji} on {a.id}", run)
+
+
+def cmd_mark_read(a):
+    def run(cid):
+        mid = a.id or next((m["id"] for m in iter_msgs(cid, page=10, max_pages=1)), None)
+        if not mid:
+            sys.exit("nothing to mark as read")
+        a.id = mid
+        now = int(time.time() * 1000)
+        chat_call("PUT", f"/v1/users/ME/conversations/{urllib.parse.quote(cid, safe='')}/properties?name=consumptionhorizon",
+                  {"consumptionhorizon": f"{mid};{now};{now}"})
+    write_cmd(a, f"mark read up to {a.id or 'newest'}", run)
 
 
 TROUTER_TTL = 86400
@@ -674,6 +738,19 @@ def main():
     sd.add_argument("--json", action="store_true")
     sd.add_argument("--yes", action="store_true", help="really send (default is a dry run)")
     sd.set_defaults(fn=cmd_send)
+    for name, fn, extra in (("edit", cmd_edit, ("id", "text")), ("delete", cmd_delete, ("id",)),
+                            ("react", cmd_react, ("id", "emoji")), ("mark-read", cmd_mark_read, ())):
+        sp = sub.add_parser(name)
+        sp.add_argument("chat")
+        for x in extra:
+            sp.add_argument(x)
+        if name == "mark-read":
+            sp.add_argument("id", nargs="?", help="message id (default: newest)")
+        if name == "react":
+            sp.add_argument("--remove", action="store_true")
+        sp.add_argument("--json", action="store_true")
+        sp.add_argument("--yes", action="store_true", help="really do it (default is a dry run)")
+        sp.set_defaults(fn=fn)
     a = ap.parse_args()
     DEBUG = a.debug
     try:
