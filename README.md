@@ -21,6 +21,9 @@ Below `teams_cli.py` and `teams` are the same.
 teams_cli.py login                          # opens the browser; paste the final blank-page URL back
 teams_cli.py chats [--json|--ids]           # recent conversations: kind, unread count, preview
 teams_cli.py members <chat> [--json]        # participants (partial for large chats)
+teams_cli.py people <name|email> [-n 10] [--json]  # directory search; prints mri and the 1:1 chat id
+teams_cli.py presence [me|oid|mri ...] [--json]    # availability, activity, out of office
+teams_cli.py search "text" [-n 20] [--json]        # server-side message search in all chats
 teams_cli.py read <chat> [-n 20] [--before ID] [--json]
 teams_cli.py watch [chat ...] [--json]      # live events (Trouter websocket)
 teams_cli.py download <chat> <id> [-o DIR]  # save image attachments (files: prints the SharePoint url)
@@ -45,7 +48,7 @@ Claude Code) use `login --url '<copied url>'`. The one-time code in that URL exp
 
 ## Storage
 
-- Tokens (refresh, access, skype) are stored as separate GNOME keyring items (`secret-tool`, service `teams-cli`).
+- Tokens (refresh, access, skype; presence and substrate on first `presence`/`search`) are stored as separate GNOME keyring items (`secret-tool`, service `teams-cli`).
   A token is only removed from the file after it has been read back from the keyring.
 - Without a keyring they stay in `~/.config/teams-cli/state.json` (mode 0600) and a warning is printed.
 - The same file holds non-secret state: chat list, names, endpoint id (must stay stable, otherwise Teams reports
@@ -61,7 +64,9 @@ Claude Code) use `login --url '<copied url>'`. The one-time code in that URL exp
 
 Plain text by default; `--json` for scripts (`chats` and `read` print one JSON array, `watch` prints one object per
 line). A message is always `id, chat_id, time, from, from_id, type, text, html, attachments, mentions, reactions,
-reply_to, edited, deleted`. In `--json` mode errors are `{"error": "..."}` on stdout with exit code 1.
+reply_to, thread_id, edited, deleted`. `thread_id` is the root message of a channel thread (null for the root
+itself and in chats). `search` results have `id, chat_id, thread_id, chat, from, time, text` (`id` is derived from the send time, which
+is how Teams numbers messages). In `--json` mode errors are `{"error": "..."}` on stdout with exit code 1.
 
 `watch --json` events (`event` field): `message`, `message_updated`, `message_deleted`, `typing`, `typing_stop`, `read`
 (`chat_id`, `read_up_to`), `system`, `status` (`connected`, `disconnected`, `stalled`, `auth_failed`).
@@ -74,4 +79,5 @@ reply_to, edited, deleted`. In `--json` mode errors are `{"error": "..."}` on st
 
 ## Not done
 
-Non-image files (SharePoint, other auth), cards, starting new 1:1 chats, channel threads, search, presence.
+Non-image files (SharePoint, other auth), cards, starting a 1:1 chat that does not exist yet, replying in a channel
+thread, full member lists of large chats.

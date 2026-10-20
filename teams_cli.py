@@ -10,7 +10,7 @@ Tokens go to the GNOME keyring (secret-tool); without one, to ~/.config/teams-cl
   teams_cli.py watch [chat ...] [--json]            # live messages via Trouter (needs websockets)
   teams_cli.py send <n|text> "message" [--yes]   # without --yes only prints what would be sent
 """
-import argparse, asyncio, base64, gzip, html, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid, webbrowser
+import argparse, asyncio, base64, datetime, gzip, html, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid, webbrowser
 
 CLIENT_ID = "1fec8e78-bce4-4aaf-ab1b-5451cc387264"  # Teams desktop/web public client
 REDIRECT = "https://login.microsoftonline.com/common/oauth2/nativeclient"
@@ -27,7 +27,9 @@ STATE = os.path.join(STATE_DIR, "state.json")
 DEBUG = False
 
 
-SECRET_KEYS = ("refresh_token", "access_token", "skype_token")
+SECRET_KEYS = ("refresh_token", "access_token", "skype_token", "presence_token", "substrate_token")
+PRESENCE = "https://presence.teams.microsoft.com"
+SUBSTRATE = "https://substrate.office.com"
 _cache = None
 _warned = False
 
@@ -168,6 +170,8 @@ def session():
     st["skype_exp"] = time.time() + int(tokens.get("expiresIn", 3000)) - 60
     gtms = a.get("regionGtms") or {}
     st["chat_host"] = (gtms.get("chatService") or DEFAULT_CHAT_HOST).rstrip("/")
+    if a.get("region"):
+        st["region"] = a["region"]
     if DEBUG:
         print("authz keys:", sorted(a), "| chat_host:", st["chat_host"], file=sys.stderr)
     if not st["skype_token"]:
@@ -189,6 +193,33 @@ def chat_call(method, path, body=None):
 
 def chat_get(path):
     return chat_call("GET", path)
+
+
+def resource_token(resource, key):
+    """Access token for another resource (presence, substrate), from the same refresh token."""
+    st = load()
+    if st.get(key) and st.get(key + "_exp", 0) > time.time() + 120:
+        return st[key]
+    access()  # makes sure a refresh token is there
+    st = load()
+    d = token_request({"grant_type": "refresh_token", "refresh_token": st["refresh_token"],
+                       "scope": resource + "/.default openid profile offline_access"})
+    st["refresh_token"] = d.get("refresh_token", st["refresh_token"])
+    st[key] = d["access_token"]
+    st[key + "_exp"] = time.time() + int(d.get("expires_in", 3000))
+    save(st)
+    return st[key]
+
+
+def mt_call(path, body):
+    """POST to the Teams middle tier (people search, profiles): teams.microsoft.com/api/mt/<region>/beta/."""
+    tok, host = session()
+    region = load().get("region") or urllib.parse.urlsplit(host).hostname.split(".")[0]
+    hdr = {"Authorization": "Bearer " + access(), "X-Skypetoken": tok, "Accept": "application/json",
+           "Content-Type": "application/json", "Origin": "https://teams.microsoft.com",
+           "Referer": "https://teams.microsoft.com/"}
+    data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+    return http("POST", f"https://teams.microsoft.com/api/mt/{region}/beta/{path}", hdr, data)[1]
 
 
 def my_oid():
@@ -262,6 +293,7 @@ def msg_json(m, cid=None):
             "type": m.get("messagetype"), "text": text_of(content), "html": content,
             "attachments": att, "mentions": [{"id": x.get("mri"), "name": x.get("displayName")} for x in _prop_list(props, "mentions") if isinstance(x, dict)],
             "reactions": reactions, "reply_to": reply,
+            "thread_id": m.get("rootMessageId") if m.get("rootMessageId") != m.get("id") else None,
             "edited": bool(props.get("edittime")), "deleted": bool(props.get("deletetime"))}
 
 
@@ -417,6 +449,9 @@ def cmd_members(a):
     rows = [{"id": x["id"], "name": seen.get(x["id"]), "role": x.get("role")} for x in d.get("members", [])]
     known = {r["id"] for r in rows}
     rows += [{"id": i, "name": n, "role": None} for i, n in seen.items() if i not in known]
+    names = profiles([r["id"] for r in rows if not r["name"]])
+    for r in rows:
+        r["name"] = r["name"] or names.get(r["id"])
     total = (d.get("rosterSummary") or {}).get("memberCount") or len(d.get("members", []))
     if a.json:
         print(json.dumps({"chat_id": cid, "member_count": total, "members": rows}, ensure_ascii=False, indent=1))
@@ -426,7 +461,107 @@ def cmd_members(a):
         print(f"  {r['name'] or '?':40} {r['role'] or '':6} {r['id']}")
 
 
+def mri_of(x):
+    """'me', an object id or a full mri -> mri."""
+    if x == "me":
+        x = my_oid()
+    return x if x.startswith("8:") or x.startswith("28:") else "8:orgid:" + x
+
+
+def one_to_one_id(mri):
+    """1:1 chat id: both object ids, sorted, joined by '_'."""
+    a, b = sorted([my_oid(), mri.split(":")[-1]])
+    return f"19:{a}_{b}@unq.gbl.spaces"
+
+
+def profiles(mris):
+    """mri -> display name via the directory (works for anyone in the tenant)."""
+    mris = [m for m in dict.fromkeys(mris) if m.startswith("8:orgid:")]
+    out_ = {}
+    for i in range(0, len(mris), 500):
+        d = mt_call("users/fetchShortProfile?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true"
+                    "&includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true", mris[i:i + 500])
+        out_.update({u["mri"]: u.get("displayName") for u in (d or {}).get("value", []) if u.get("mri")})
+    return out_
+
+
+def cmd_people(a):
+    d = mt_call("users/searchV2?includeDLs=true&includeBots=true&enableGuest=true&source=newChat&skypeTeamsInfo=true",
+                a.query)  # the body is the raw text, not JSON
+    rows = [{"id": u.get("mri"), "name": u.get("displayName"), "email": u.get("email") or u.get("mail"),
+             "title": u.get("jobTitle"), "department": u.get("department"),
+             "chat_id": one_to_one_id(u["mri"]) if (u.get("mri") or "").startswith("8:orgid:") else None}
+            for u in (d or {}).get("value", [])][:a.n]
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return
+    for r in rows:
+        print(f"{r['name'] or '?':40} {r['email'] or '':36} {r['department'] or ''}")
+        print(f"{'':40} {r['id']}  1:1: {r['chat_id']}")
+
+
+def cmd_presence(a):
+    mris = [mri_of(x) for x in a.who or ["me"]]
+    hdr = {"Authorization": "Bearer " + resource_token(PRESENCE, "presence_token"), "Accept": "application/json",
+           "Content-Type": "application/json", "x-ms-client-user-agent": "Teams-V2-Desktop", "x-ms-correlation-id": "1"}
+    rows = []
+    for i in range(0, len(mris), 650):
+        _, d = http("POST", PRESENCE + "/v1/presence/getpresence/", hdr,
+                    json.dumps([{"mri": m} for m in mris[i:i + 650]]).encode())
+        for x in d or []:
+            p = x.get("presence") or {}
+            rows.append({"id": x.get("mri"), "availability": p.get("availability"), "activity": p.get("activity"),
+                         "out_of_office": bool((p.get("calendarData") or {}).get("isOutOfOffice")),
+                         "last_active": p.get("lastActiveTime"), "device": p.get("deviceType")})
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return
+    names = profiles([r["id"] for r in rows])
+    for r in rows:
+        ooo = "  out of office" if r["out_of_office"] else ""
+        print(f"{names.get(r['id']) or r['id']:40} {r['availability'] or '?':14} {r['activity'] or ''}{ooo}")
+
+
+def _addr(x):
+    if not isinstance(x, dict):
+        return x
+    e = x.get("EmailAddress") or x
+    return e.get("Name") or e.get("Address")
+
+
+def cmd_search(a):
+    body = {"EntityRequests": [{"EntityType": "Message", "ContentSources": ["Teams"], "Query": {"QueryString": a.query},
+                                "From": 0, "Size": a.n}],
+            "Cvid": str(uuid.uuid4()), "Scenario": {"Name": "powerbar"}}
+    _, d = http("POST", SUBSTRATE + "/search/api/v2/query",
+                {"Authorization": "Bearer " + resource_token(SUBSTRATE, "substrate_token"),
+                 "Accept": "application/json", "Content-Type": "application/json"}, json.dumps(body).encode())
+    sets = [r for es in (d or {}).get("EntitySets", []) for r in es.get("ResultSets", [])]
+    total = sum(r.get("Total", 0) for r in sets)
+    rows = []
+    for h in (h for r in sets for h in r.get("Results", [])):
+        s = h.get("Source") or {}
+        where = " / ".join(x for x in (s.get("TeamName"), s.get("ChannelName")) if x) or s.get("Subject") or s.get("DisplayTo")
+        conv, _, root = (s.get("ClientConversationId") or "").partition(";messageid=")
+        sent = s.get("DateTimeSent")
+        mid = None
+        if sent:  # message id = send time in ms
+            mid = str(int(datetime.datetime.fromisoformat(sent.replace("Z", "+00:00")).timestamp() * 1000 + 0.5))
+        rows.append({"id": mid, "chat_id": conv or None, "thread_id": root if root and "@thread.tacv2" in conv else None, "chat": where, "from": _addr(s.get("From") or s.get("Sender")),
+                     "time": s.get("DateTimeSent") or s.get("DateTimeReceived"),
+                     "text": s.get("Preview") or h.get("HitHighlightedSummary")})
+    if a.json:
+        print(json.dumps({"total": total, "results": rows}, ensure_ascii=False, indent=1))
+        return
+    print(f"{total} matches, showing {len(rows)}")
+    for r in rows:
+        print(f"[{ts(r['time'])}] {(r['chat'] or '')[:30]:30} {r['from'] or '?'}: {(r['text'] or '').replace(chr(10), ' ')[:90]}")
+        print(f"{'':22}{r['chat_id']}")
+
+
 def resolve(sel):
+    if ":" in sel:  # a full chat id needs no cache lookup
+        return sel
     st = load()
     ids = st.get("chats") or []
     if sel.isdigit() and int(sel) < len(ids):
@@ -850,6 +985,20 @@ def main():
     mb.add_argument("chat")
     mb.add_argument("--json", action="store_true")
     mb.set_defaults(fn=cmd_members)
+    pp = sub.add_parser("people", help="search the directory by name or email")
+    pp.add_argument("query")
+    pp.add_argument("-n", type=int, default=10)
+    pp.add_argument("--json", action="store_true")
+    pp.set_defaults(fn=cmd_people)
+    pr = sub.add_parser("presence", help="availability of people (default: me)")
+    pr.add_argument("who", nargs="*", help="'me', object ids or mris (8:orgid:...)")
+    pr.add_argument("--json", action="store_true")
+    pr.set_defaults(fn=cmd_presence)
+    se = sub.add_parser("search", help="server-side search of messages in all chats")
+    se.add_argument("query")
+    se.add_argument("-n", type=int, default=20)
+    se.add_argument("--json", action="store_true")
+    se.set_defaults(fn=cmd_search)
     dl = sub.add_parser("download", help="save image attachments of a message (files: prints the SharePoint url)")
     dl.add_argument("chat")
     dl.add_argument("id")
