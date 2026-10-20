@@ -20,7 +20,7 @@ class Live(unittest.TestCase):
         self.assertIn("title", self.chats[0])
 
     def test_teams_tree(self):
-        tree = tc.channel_tree(tc.all_conversations(86400))
+        tree = tc.teams_tree(refresh=True)
         self.assertTrue(tree)
         self.assertTrue(all(t["channels"] for t in tree))
 

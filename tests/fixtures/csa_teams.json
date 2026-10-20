@@ -1,0 +1,30 @@
+{
+ "teams": [
+  {"id": "19:gen-b@thread.tacv2", "displayName": "beta team", "isFavorite": false, "isArchived": false,
+   "membershipSummary": {"totalMemberCount": 4}, "teamSiteInformation": {"groupId": "g-b"},
+   "channels": [
+    {"id": "19:gen-b@thread.tacv2", "displayName": "General", "isGeneral": true, "channelType": 0, "isMember": true,
+     "isMessageRead": true}
+   ]},
+  {"id": "19:gen-z@thread.tacv2", "displayName": "Zeta (old)", "isArchived": true,
+   "teamSiteInformation": {"groupId": "g-z"},
+   "channels": [{"id": "19:gen-z@thread.tacv2", "displayName": "General", "isGeneral": true, "channelType": 0}]},
+  {"id": "19:gen-a@thread.tacv2", "displayName": "Alpha", "isFavorite": true, "isArchived": false,
+   "membershipSummary": {"totalMemberCount": 95}, "teamSiteInformation": {"groupId": "g-a"},
+   "channels": [
+    {"id": "19:zz@thread.tacv2", "displayName": "Zebra", "isGeneral": false, "channelType": 0, "isMember": true,
+     "isMessageRead": true, "isPinned": true},
+    {"id": "19:news@thread.tacv2", "displayName": "news", "isGeneral": false, "channelType": 0, "isMember": true,
+     "isMessageRead": false, "isMuted": true},
+    {"id": "19:gen-a@thread.tacv2", "displayName": "General", "isGeneral": true, "channelType": 0, "isMember": true,
+     "isMessageRead": true},
+    {"id": "19:secret@thread.skype", "displayName": "Secret", "isGeneral": false, "channelType": 1, "isMember": true,
+     "isMessageRead": true},
+    {"id": "19:other@thread.skype", "displayName": "Not joined", "isGeneral": false, "channelType": 1, "isMember": false},
+    {"id": "19:gone@thread.tacv2", "displayName": "Gone", "isGeneral": false, "channelType": 0, "isMember": true,
+     "isDeleted": true}
+   ]},
+  {"id": "19:del@thread.tacv2", "displayName": "Deleted", "isDeleted": true, "channels": []}
+ ],
+ "chats": [], "users": [], "privateFeeds": [], "metadata": {}
+}

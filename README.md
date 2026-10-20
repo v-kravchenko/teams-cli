@@ -21,7 +21,7 @@ Below `teams_cli.py` and `teams` are the same.
 teams_cli.py login [--url URL|-]            # print the sign-in URL; --url completes the login
 teams_cli.py chats [--json|--ids]           # recent conversations: kind, unread count, preview
 teams_cli.py chats --all [--refresh]        # every conversation incl. channels (cached; unread is a dot)
-teams_cli.py teams [--json] [--refresh]     # teams -> channels tree (cached for 24 h)
+teams_cli.py teams [--json] [--refresh]     # teams -> channels tree, unread dots (cached for 15 min)
 teams_cli.py members <chat> [--json]        # participants (partial for large chats)
 teams_cli.py people <name|email> [-n 10] [--json]  # directory search; prints mri and the 1:1 chat id
 teams_cli.py presence [me|oid|mri ...] [--json]    # availability, activity, out of office
@@ -57,11 +57,12 @@ A GUI can pass `--url -` and write the URL to stdin instead. The one-time code i
 
 ## Storage
 
-- Tokens (refresh, access, skype; presence and substrate on first `presence`/`search`) are stored as separate GNOME keyring items (`secret-tool`, service `teams-cli`). A token is only removed from the file after it has been read back from the keyring.
+- Tokens (refresh, access, skype; presence, substrate and aggregator on first `presence`/`search`/`teams`) are stored as separate GNOME keyring items (`secret-tool`, service `teams-cli`). A token is only removed from the file after it has been read back from the keyring.
 - Without a keyring they stay in `~/.config/teams-cli/state.json` (file 0600, directory 0700) and a warning is printed.
 - The same file holds non-secret state that must survive restarts: the Trouter `endpoint` id (a new one hits "Endpoint limit exceeded"), region, chat host and token expiry times.
 - The cache lives in `~/.cache/teams-cli/` (0700). It is plain JSON, readable only by your user (files 0600). JSON is enough at this size (3.4 MB parses in ~30 ms); a database would only pay off if full message history were cached.
-  - `conversations.json` — the full conversation list (1217 conversations, ~3.4 MB). Refetched after 15 min (`chats --all`) or 24 h (`teams`), or with `--refresh`.
+  - `conversations.json` — the full conversation list (1217 conversations, ~3.4 MB). Refetched after 15 min (`chats --all`) or with `--refresh`; `teams` reads it only as a fallback.
+  - `teams.json` — the teams -> channels tree from the chat service aggregator (one request, ~5 s), cached for 15 min.
   - `chatinfo.json` — chat ids for list numbers, chat titles and peer names.
   - `messages/<hash>.json` — the last 50 messages per chat, used only as an offline fallback for `read` (and as the first paint for a GUI). `watch` keeps it current.
   - `profiles.json` — directory display names, cached for 7 days.
@@ -96,7 +97,9 @@ is how Teams numbers messages). In `--json` mode errors are `{"error": "..."}` o
 `chats` rows carry an exact `unread` count (capped, see `unread_capped`). `chats --all` rows have no `n`/number and
 `unread` is `true` (something newer than the read marker), `false`, or `null` when the list payload has no read
 marker for that conversation — no per-chat requests are made there. `teams --json` is
-`[{id, name, channels: [{id, name, kind}]}]` with `kind` = `general`, `channel` or `private`.
+`[{id, name, favorite, archived, members, channels: [{id, name, kind, unread, pinned, muted}]}]` with `kind` =
+`general`, `channel` or `private`. Channels follow the client's order: General, pinned, then by name; channels you have
+not joined are left out. If the aggregator fails, the tree is built from the conversation list without the flags.
 
 `watch --json` events (`event` field): `message`, `message_updated`, `message_deleted`, `typing`, `typing_stop`, `read`
 (`chat_id`, `read_up_to`), `system`, `status` (`connected`, `disconnected`, `stalled`, `auth_failed`).

@@ -29,13 +29,15 @@ CONV_CACHE = os.path.join(CACHE_DIR, "conversations.json")
 CHATINFO_CACHE = os.path.join(CACHE_DIR, "chatinfo.json")
 PROFILES_CACHE = os.path.join(CACHE_DIR, "profiles.json")
 MESSAGES_DIR = os.path.join(CACHE_DIR, "messages")
+TEAMS_CACHE = os.path.join(CACHE_DIR, "teams.json")
 CACHE_VERSION = 1
 DEBUG = False
 
 
-SECRET_KEYS = ("refresh_token", "access_token", "skype_token", "presence_token", "substrate_token")
+SECRET_KEYS = ("refresh_token", "access_token", "skype_token", "presence_token", "substrate_token", "csa_token")
 PRESENCE = "https://presence.teams.microsoft.com"
 SUBSTRATE = "https://substrate.office.com"
+CSA = "https://chatsvcagg.teams.microsoft.com"  # chat service aggregator: teams, channels, flags in one call
 _cache = None
 _warned = False
 _TOKEN_LOCK = threading.RLock()  # token refresh writes state.json; chat lists fetch in a thread pool
@@ -652,17 +654,67 @@ def channel_tree(convs):
     return sorted(rows, key=lambda t: t["name"].casefold())
 
 
+def csa_get(path):
+    hdr = {"Authorization": "Bearer " + resource_token(CSA, "csa_token"), "Accept": "application/json"}
+    return http("GET", "https://teams.microsoft.com/api/csa/api/v1/teams/users/me" + path, hdr)[1]
+
+
+def csa_tree(d, pinned=()):
+    """Teams -> channels from the aggregator: real team names, pinned order, unread/muted/archived flags."""
+    order = {cid: i for i, cid in enumerate(pinned)}
+    rows = []
+    for t in d.get("teams") or []:
+        if t.get("isDeleted"):
+            continue
+        chans = []
+        for ch in t.get("channels") or []:
+            if ch.get("isDeleted") or ch.get("isMember") is False:  # channels the user has not joined
+                continue
+            kind = "general" if ch.get("isGeneral") else "private" if ch.get("channelType") == 1 else "channel"
+            chans.append({"id": ch["id"], "name": ch.get("displayName") or ch["id"], "kind": kind,
+                          "unread": ch.get("isMessageRead") is False, "pinned": ch["id"] in order,
+                          "muted": bool(ch.get("isMuted"))})
+        chans.sort(key=lambda x: (x["kind"] != "general", order.get(x["id"], len(order)), x["name"].casefold()))
+        gid = (t.get("teamSiteInformation") or {}).get("groupId") or t["id"]
+        rows.append({"id": gid, "name": t.get("displayName") or f"team {gid[:8]}", "channels": chans,
+                     "favorite": bool(t.get("isFavorite")), "archived": bool(t.get("isArchived")),
+                     "members": (t.get("membershipSummary") or {}).get("totalMemberCount")})
+    return sorted(rows, key=lambda t: (t["archived"], t["name"].casefold()))
+
+
+def teams_tree(refresh=False):
+    """The tree from the aggregator (cached 15 min); falls back to the full conversation list."""
+    cache = _read_cache(TEAMS_CACHE)
+    if cache and not refresh and time.time() - cache.get("fetched_at", 0) < 900:
+        return cache.get("teams") or []
+    try:
+        d = csa_get("?isPrefetch=false&enableMembershipSummary=true")
+        try:
+            pinned = csa_get("/pinnedChannels").get("pinChannelOrder") or []
+        except TeamsError:
+            pinned = []
+    except TeamsError as e:
+        print(f"warning: aggregator failed ({e}); building the tree from the conversation list", file=sys.stderr)
+        return channel_tree(all_conversations(86400, refresh,
+                                              progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr)))
+    tree = csa_tree(d, pinned)
+    _write_cache(TEAMS_CACHE, {"fetched_at": time.time(), "teams": tree})
+    return tree
+
+
 def cmd_teams(a):
-    convs = all_conversations(86400, a.refresh,
-                              progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr))
-    tree = channel_tree(convs)
+    tree = teams_tree(a.refresh)
     if a.json:
         print(json.dumps(tree, ensure_ascii=False, indent=1))
         return
     for t in tree:
-        print(clean(t["name"]))
+        tags = [f"{t['members']} members"] if t.get("members") else []
+        tags += ["archived"] * bool(t.get("archived"))
+        print(clean(t["name"]) + (f"  ({', '.join(tags)})" if tags else ""))
         for ch in t["channels"]:
-            print(f"  {clean(ch['name'])}" + ("  (private)" if ch["kind"] == "private" else ""))
+            tags = [k for k in ("private", "pinned", "muted") if ch["kind"] == k or ch.get(k) is True]
+            dot = "•" if ch.get("unread") else " "
+            print(f"  {dot} {clean(ch['name'])}" + (f"  ({', '.join(tags)})" if tags else ""))
 
 
 def cmd_chats(a):
@@ -1150,7 +1202,8 @@ def cmd_logout(a):
     for k in SECRET_KEYS:
         keyring_clear(k)
     st = load()
-    for k in list(SECRET_KEYS) + ["access_exp", "skype_exp", "presence_token_exp", "substrate_token_exp"]:
+    for k in list(SECRET_KEYS) + ["access_exp", "skype_exp", "presence_token_exp", "substrate_token_exp",
+                                    "csa_token_exp"]:
         st.pop(k, None)
     save(st)
     clear_cache()
@@ -1410,8 +1463,8 @@ def main():
     c.add_argument("--all", action="store_true", help="every conversation incl. channels (cached; unread is a dot)")
     c.add_argument("--refresh", action="store_true", help="with --all: refetch the full conversation list")
     c.set_defaults(fn=cmd_chats)
-    tm = sub.add_parser("teams", help="teams -> channels tree (cached for 24 h)")
-    tm.add_argument("--refresh", action="store_true", help="refetch the conversation list")
+    tm = sub.add_parser("teams", help="teams -> channels tree with unread dots (cached for 15 min)")
+    tm.add_argument("--refresh", action="store_true", help="refetch the tree")
     tm.add_argument("--json", action="store_true")
     tm.set_defaults(fn=cmd_teams)
     r = sub.add_parser("read")
