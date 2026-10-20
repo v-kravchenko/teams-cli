@@ -439,6 +439,7 @@ def cmd_send(a):
 
 
 TROUTER_TTL = 86400
+SILENCE_LIMIT = 180
 TROUTER_TC = {"cv": "2024.23.01.2", "ua": "TeamsCDL", "hr": "", "v": "49/25113001312"}
 REGISTRAR = "https://teams.microsoft.com/registrar/prod/V2/registrations"
 
@@ -495,9 +496,38 @@ def decode_event(req):
     return obj
 
 
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def status(as_json, state, **kw):
+    if as_json:
+        out({"event": "status", "state": state, **kw})
+    else:
+        print(f"[{state}] " + " ".join(f"{k}={v}" for k, v in kw.items()), file=sys.stderr, flush=True)
+
+
+def emit_read(res, want, as_json, horizons):
+    """ConversationUpdate -> `read` event when the read marker moved (JSON mode only)."""
+    cid = res.get("id")
+    hz = horizon_of(res)
+    if not as_json or not hz or (want and cid not in want) or horizons.get(cid) == hz:
+        return
+    horizons[cid] = hz
+    out({"event": "read", "chat_id": cid, "read_up_to": str(hz)})
+
+
 def emit(res, kind, want, as_json, seen):
     cid = res.get("conversationid") or (res.get("conversationLink") or "").rsplit("/", 1)[-1]
     if want and cid not in want:
+        return
+    mt = res.get("messagetype") or ""
+    props = res.get("properties") or {}
+    base = msg_json(res, cid)
+    if mt.startswith("Control/"):
+        if as_json and mt in ("Control/Typing", "Control/ClearTyping"):
+            out({"event": "typing" if mt == "Control/Typing" else "typing_stop", "chat_id": cid,
+                 "from": base["from"], "from_id": base["from_id"], "time": base["time"]})
         return
     mid = (res.get("id"), res.get("version"))
     if mid in seen:
@@ -505,16 +535,23 @@ def emit(res, kind, want, as_json, seen):
     seen.add(mid)
     st = load()
     title = st.get("titles", {}).get(cid) or st.get("names", {}).get(cid) or cid[-24:]
-    text = msg_text(res) or f"<{res.get('messagetype', '?')}>"
-    who = res.get("imdisplayname") or "?"
-    if as_json:
-        print(json.dumps({**msg_json(res, cid), "chat": title, "event": kind}, ensure_ascii=False), flush=True)
+    if mt not in REAL_TYPES:
+        if as_json:
+            out({**base, "chat": title, "event": "system"})
+        return
+    if props.get("deletetime"):
+        event = "message_deleted"
     else:
-        mark = " (edited)" if kind == "MessageUpdate" else ""
-        print(f"[{ts(res.get('composetime'))}] {title} | {who}: {text}{mark}", flush=True)
+        event = "message" if kind == "NewMessage" else "message_updated"
+    if as_json:
+        out({**base, "chat": title, "event": event})
+    else:
+        text = msg_text(res) or f"<{mt}>"
+        mark = {"message": "", "message_updated": " (edited)", "message_deleted": " (deleted)"}[event]
+        print(f"[{ts(res.get('composetime'))}] {title} | {res.get('imdisplayname') or '?'}: {text}{mark}", flush=True)
 
 
-async def watch_once(want, as_json, seen):
+async def watch_once(want, as_json, seen, horizons):
     try:
         import websockets
     except ImportError:
@@ -524,6 +561,7 @@ async def watch_once(want, as_json, seen):
                                   max_size=2**24, ping_interval=None) as ws:
         counter = 1
         tasks = []
+        last = time.monotonic()
 
         async def pinger():
             nonlocal counter
@@ -535,9 +573,23 @@ async def watch_once(want, as_json, seen):
         async def reregister():
             while True:
                 await asyncio.sleep(TROUTER_TTL - 600)
-                await asyncio.to_thread(trouter_register, surl)
+                try:
+                    await asyncio.to_thread(trouter_register, surl)
+                except Exception as e:
+                    status(as_json, "error", detail=f"reregister failed: {type(e).__name__}: {str(e)[:100]}")
+                    await ws.close()
+                    return
+
+        async def watchdog():
+            while True:
+                await asyncio.sleep(20)
+                if time.monotonic() - last > SILENCE_LIMIT:
+                    status(as_json, "stalled", detail=f"no frames for {SILENCE_LIMIT}s")
+                    await ws.close()
+                    return
 
         async for frame in ws:
+            last = time.monotonic()
             if DEBUG:
                 print("ws frame:", frame[:3], len(frame), file=sys.stderr)
             if frame.startswith("1::"):
@@ -546,8 +598,8 @@ async def watch_once(want, as_json, seen):
                     "connectparams": cparams}]}
                 await ws.send("5:::" + json.dumps(auth))
                 await asyncio.to_thread(trouter_register, surl)
-                tasks = [asyncio.create_task(pinger()), asyncio.create_task(reregister())]
-                print("connected to Trouter, waiting for messages (Ctrl-C to stop)", file=sys.stderr, flush=True)
+                tasks = [asyncio.create_task(t()) for t in (pinger, reregister, watchdog)]
+                status(as_json, "connected")
             elif frame.startswith("2::"):
                 await ws.send("2::")
             elif frame.startswith("3:::"):
@@ -557,6 +609,11 @@ async def watch_once(want, as_json, seen):
                     ev = decode_event(req)
                     if ev.get("type") == "EventMessage" and ev.get("resourceType") in ("NewMessage", "MessageUpdate"):
                         emit(ev["resource"], ev["resourceType"], want, as_json, seen)
+                    elif ev.get("resourceType") == "ConversationUpdate":
+                        emit_read(ev["resource"], want, as_json, horizons)
+                    elif os.environ.get("TEAMS_DUMP"):
+                        with open(os.environ["TEAMS_DUMP"], "a") as f:
+                            f.write(json.dumps(ev, ensure_ascii=False)[:3000] + "\n")
             elif frame.startswith("5:") and "trouter.message_loss" in frame:
                 await asyncio.to_thread(trouter_register, surl)
         for t in tasks:
@@ -565,18 +622,20 @@ async def watch_once(want, as_json, seen):
 
 def cmd_watch(a):
     want = {resolve(c) for c in a.chats}
-    seen = set()
+    seen, horizons = set(), {}
     delay = 2
     while True:
         try:
-            asyncio.run(watch_once(want, a.json, seen))
+            asyncio.run(watch_once(want, a.json, seen, horizons))
             delay = 2
+            status(a.json, "disconnected", retry_in=delay)
         except KeyboardInterrupt:
             return
-        except SystemExit:
+        except SystemExit as e:
+            status(a.json, "auth_failed", detail=str(e.code))
             raise
         except Exception as e:
-            print(f"connection lost ({type(e).__name__}: {str(e)[:120]}); retry in {delay}s", file=sys.stderr, flush=True)
+            status(a.json, "disconnected", detail=f"{type(e).__name__}: {str(e)[:120]}", retry_in=delay)
         try:
             time.sleep(delay)
         except KeyboardInterrupt:
