@@ -20,6 +20,8 @@ Below `teams_cli.py` and `teams` are the same.
 ```
 teams_cli.py login                          # opens the browser; paste the final blank-page URL back
 teams_cli.py chats [--json|--ids]           # recent conversations: kind, unread count, preview
+teams_cli.py chats --all [--refresh]        # every conversation incl. channels (cached; unread is a dot)
+teams_cli.py teams [--json] [--refresh]     # teams -> channels tree (cached for 24 h)
 teams_cli.py members <chat> [--json]        # participants (partial for large chats)
 teams_cli.py people <name|email> [-n 10] [--json]  # directory search; prints mri and the 1:1 chat id
 teams_cli.py presence [me|oid|mri ...] [--json]    # availability, activity, out of office
@@ -53,6 +55,9 @@ Claude Code) use `login --url '<copied url>'`. The one-time code in that URL exp
 - Without a keyring they stay in `~/.config/teams-cli/state.json` (mode 0600) and a warning is printed.
 - The same file holds non-secret state: chat list, names, endpoint id (must stay stable, otherwise Teams reports
   "Endpoint limit exceeded").
+- `chats --all` and `teams` cache the full conversation list (1218 conversations, ~3.4 MB) in
+  `~/.cache/teams-cli/conversations.json`; it is refetched after 15 min (`chats --all`) or 24 h (`teams`), or with
+  `--refresh`. Deleting it only costs one slow fetch (~6 s).
 - Tokens are never printed.
 
 ## Safety
@@ -74,6 +79,11 @@ line). A message is always `id, chat_id, time, from, from_id, type, text, html, 
 reply_to, thread_id, edited, deleted`. `thread_id` is the root message of a channel thread (null for the root
 itself and in chats). `search` results have `id, chat_id, thread_id, chat, from, time, text` (`id` is derived from the send time, which
 is how Teams numbers messages). In `--json` mode errors are `{"error": "..."}` on stdout with exit code 1.
+
+`chats` rows carry an exact `unread` count (capped, see `unread_capped`). `chats --all` rows have no `n`/number and
+`unread` is `true` (something newer than the read marker), `false`, or `null` when the list payload has no read
+marker for that conversation — no per-chat requests are made there. `teams --json` is
+`[{id, name, channels: [{id, name, kind}]}]` with `kind` = `general`, `channel` or `private`.
 
 `watch --json` events (`event` field): `message`, `message_updated`, `message_deleted`, `typing`, `typing_stop`, `read`
 (`chat_id`, `read_up_to`), `system`, `status` (`connected`, `disconnected`, `stalled`, `auth_failed`).

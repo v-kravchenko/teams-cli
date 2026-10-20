@@ -10,7 +10,7 @@ Tokens go to the GNOME keyring (secret-tool); without one, to ~/.config/teams-cl
   teams_cli.py watch [chat ...] [--json]            # live messages via Trouter (needs websockets)
   teams_cli.py send <n|text> "message" [--yes]   # without --yes only prints what would be sent
 """
-import argparse, asyncio, base64, datetime, gzip, html, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid, webbrowser
+import argparse, asyncio, base64, datetime, gzip, html, json, os, re, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid, webbrowser
 
 CLIENT_ID = "1fec8e78-bce4-4aaf-ab1b-5451cc387264"  # Teams desktop/web public client
 REDIRECT = "https://login.microsoftonline.com/common/oauth2/nativeclient"
@@ -24,6 +24,8 @@ TARGETS = "Passport|Skype|Lync|Thread|PSTN|Agent"
 
 STATE_DIR = os.path.expanduser("~/.config/teams-cli")
 STATE = os.path.join(STATE_DIR, "state.json")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "teams-cli")
+CONV_CACHE = os.path.join(CACHE_DIR, "conversations.json")
 DEBUG = False
 
 
@@ -32,6 +34,7 @@ PRESENCE = "https://presence.teams.microsoft.com"
 SUBSTRATE = "https://substrate.office.com"
 _cache = None
 _warned = False
+_TOKEN_LOCK = threading.RLock()  # token refresh writes state.json; chat lists fetch in a thread pool
 
 
 def keyring_get(name):
@@ -93,17 +96,22 @@ class TeamsError(Exception):
         self.status = status
 
 
-def http(method, url, headers=None, data=None, raw=False):
+def http(method, url, headers=None, data=None, raw=False, retries=3):
     req = urllib.request.Request(url, data=data, method=method, headers={"User-Agent": UA, **(headers or {})})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            body = r.read()
-            if raw:
-                return r.status, body.decode()
-            return r.status, (json.loads(body) if body else None)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise TeamsError(f"HTTP {e.code} {method} {urllib.parse.urlsplit(url).netloc}{urllib.parse.urlsplit(url).path}: {body[:300]}", e.code)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read()
+                if raw:
+                    return r.status, body.decode()
+                return r.status, (json.loads(body) if body else None)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            # GETs are safe to retry; a retried POST/PUT could send twice
+            if method == "GET" and e.code in (429, 500, 502, 503, 504) and attempt + 1 < retries:
+                time.sleep(2 ** attempt)
+                continue
+            raise TeamsError(f"HTTP {e.code} {method} {urllib.parse.urlsplit(url).netloc}{urllib.parse.urlsplit(url).path}: {body[:300]}", e.code)
 
 
 def token_request(form):
@@ -150,42 +158,44 @@ def cmd_login(a):
 
 def access():
     """OAuth access token for api.spaces.skype.com; refreshes (and rotates the refresh token) as needed."""
-    st = load()
-    if not st.get("refresh_token"):
-        raise TeamsError("not logged in: run `login` first")
-    if st.get("access_token") and st.get("access_exp", 0) > time.time() + 120:
+    with _TOKEN_LOCK:
+        st = load()
+        if not st.get("refresh_token"):
+            raise TeamsError("not logged in: run `login` first")
+        if st.get("access_token") and st.get("access_exp", 0) > time.time() + 120:
+            return st["access_token"]
+        d = token_request({"grant_type": "refresh_token", "refresh_token": st["refresh_token"]})
+        st["refresh_token"] = d.get("refresh_token", st["refresh_token"])
+        st["access_token"] = d["access_token"]
+        st["access_exp"] = time.time() + int(d.get("expires_in", 3000))
+        save(st)
         return st["access_token"]
-    d = token_request({"grant_type": "refresh_token", "refresh_token": st["refresh_token"]})
-    st["refresh_token"] = d.get("refresh_token", st["refresh_token"])
-    st["access_token"] = d["access_token"]
-    st["access_exp"] = time.time() + int(d.get("expires_in", 3000))
-    save(st)
-    return st["access_token"]
 
 
 def session():
     """Return (skype_token, chat_host); refreshes and caches as needed."""
-    st = load()
-    if st.get("skype_token") and st.get("skype_exp", 0) > time.time() + 120:
-        return st["skype_token"], st.get("chat_host", DEFAULT_CHAT_HOST)
-    acc = access()
-    st = load()
-    _, a = http("POST", "https://teams.microsoft.com/api/authsvc/v1.0/authz",
-                {"Authorization": "Bearer " + acc, "Accept": "application/json; ver=1.0",
-                 "Content-Length": "0"})
-    tokens = a.get("tokens") or a.get("skypeToken") or {}
-    st["skype_token"] = tokens.get("skypeToken") or tokens.get("skypetoken")
-    st["skype_exp"] = time.time() + int(tokens.get("expiresIn", 3000)) - 60
-    gtms = a.get("regionGtms") or {}
-    st["chat_host"] = (gtms.get("chatService") or DEFAULT_CHAT_HOST).rstrip("/")
-    if a.get("region"):
-        st["region"] = a["region"]
-    if DEBUG:
-        print("authz keys:", sorted(a), "| chat_host:", st["chat_host"], file=sys.stderr)
-    if not st["skype_token"]:
-        raise TeamsError("authz returned no skype token")
-    save(st)
-    return st["skype_token"], st["chat_host"]
+    with _TOKEN_LOCK:
+        st = load()
+        if st.get("skype_token") and st.get("skype_exp", 0) > time.time() + 120:
+            return st["skype_token"], st.get("chat_host", DEFAULT_CHAT_HOST)
+        acc = access()
+        st = load()
+        _, a = http("POST", "https://teams.microsoft.com/api/authsvc/v1.0/authz",
+                    {"Authorization": "Bearer " + acc, "Accept": "application/json; ver=1.0",
+                     "Content-Length": "0"})
+        tokens = a.get("tokens") or a.get("skypeToken") or {}
+        st["skype_token"] = tokens.get("skypeToken") or tokens.get("skypetoken")
+        st["skype_exp"] = time.time() + int(tokens.get("expiresIn", 3000)) - 60
+        gtms = a.get("regionGtms") or {}
+        st["chat_host"] = (gtms.get("chatService") or DEFAULT_CHAT_HOST).rstrip("/")
+        if a.get("region"):
+            st["region"] = a["region"]
+        if DEBUG:
+            print("authz keys:", sorted(a), "| chat_host:", st["chat_host"], file=sys.stderr)
+        if not st["skype_token"]:
+            raise TeamsError("authz returned no skype token")
+        save(st)
+        return st["skype_token"], st["chat_host"]
 
 
 def chat_call(method, path, body=None):
@@ -196,27 +206,64 @@ def chat_call(method, path, body=None):
     if body is not None:
         hdr["Content-Type"] = "application/json"
         data = json.dumps(body).encode()
-    return http(method, host + path, hdr, data)[1]
+    return http(method, path if path.startswith("http") else host + path, hdr, data)[1]
 
 
 def chat_get(path):
     return chat_call("GET", path)
 
 
+def iter_conversations(page_size=200):
+    """Yield pages of conversations, newest first; the backwardLink chain is sequential by nature."""
+    path = f"/v1/users/ME/conversations?startTime=0&pageSize={page_size}&view=msnp24Equivalent&targetType={TARGETS}"
+    while path:
+        d = chat_get(path)
+        yield [c for c in d.get("conversations") or [] if c["id"] not in ("48:notifications", "48:threads")]
+        path = (d.get("_metadata") or {}).get("backwardLink")
+
+
+def all_conversations(ttl, refresh=False, progress=None):
+    """Full conversation list from ~/.cache/teams-cli; refetches when older than ttl seconds or on refresh."""
+    cache = None
+    try:
+        with open(CONV_CACHE) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if cache and not refresh and time.time() - cache.get("fetched_at", 0) < ttl:
+        return cache.get("conversations") or []
+    convs = []
+    for page in iter_conversations():
+        convs.extend(page)
+        if progress:
+            progress(len(convs))
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CONV_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"fetched_at": time.time(), "conversations": convs}, f)
+        os.chmod(tmp, 0o600)  # previews of private messages
+        os.replace(tmp, CONV_CACHE)
+    except OSError as e:
+        print(f"warning: cannot write {CONV_CACHE}: {e}", file=sys.stderr)
+    return convs
+
+
 def resource_token(resource, key):
     """Access token for another resource (presence, substrate), from the same refresh token."""
-    st = load()
-    if st.get(key) and st.get(key + "_exp", 0) > time.time() + 120:
+    with _TOKEN_LOCK:
+        st = load()
+        if st.get(key) and st.get(key + "_exp", 0) > time.time() + 120:
+            return st[key]
+        access()  # makes sure a refresh token is there
+        st = load()
+        d = token_request({"grant_type": "refresh_token", "refresh_token": st["refresh_token"],
+                           "scope": resource + "/.default openid profile offline_access"})
+        st["refresh_token"] = d.get("refresh_token", st["refresh_token"])
+        st[key] = d["access_token"]
+        st[key + "_exp"] = time.time() + int(d.get("expires_in", 3000))
+        save(st)
         return st[key]
-    access()  # makes sure a refresh token is there
-    st = load()
-    d = token_request({"grant_type": "refresh_token", "refresh_token": st["refresh_token"],
-                       "scope": resource + "/.default openid profile offline_access"})
-    st["refresh_token"] = d.get("refresh_token", st["refresh_token"])
-    st[key] = d["access_token"]
-    st[key + "_exp"] = time.time() + int(d.get("expires_in", 3000))
-    save(st)
-    return st[key]
 
 
 def mt_call(path, body):
@@ -375,6 +422,39 @@ def chat_state(c, me):
     return newest, unread, bool(page) and len(page) >= 30 and unread == len(page)
 
 
+def chat_title(c, names, fetch=True):
+    tp = c.get("threadProperties") or {}
+    topic = tp.get("topic") or tp.get("spaceThreadTopic")
+    if c["id"] == "48:notes":
+        return "Notes (me)"
+    if topic:
+        return topic
+    nm = names.get(c["id"])
+    if nm is None and fetch and c["id"].endswith("@unq.gbl.spaces"):
+        nm = peer_name(c["id"], names)  # one request for an uncached 1:1; never do this for the full list
+    return f"[1:1] {nm}" if nm else "[chat]"
+
+
+def chat_row(c, names, me, last=None, unread=None, fetch_names=True, n=None, unread_capped=None):
+    """One row for chats/all_chats; `last` defaults to the cached lastMessage. No requests unless fetch_names."""
+    last = last or c.get("lastMessage") or {}
+    hz = horizon_of(c)
+    text = msg_text(last)
+    preview = (f"{last.get('imdisplayname') or '?'}: {text}" if text
+               else f"{last.get('imdisplayname') or '?'}: <{last.get('messagetype', '?')}>")
+    if unread is None:  # None = unknown (no consumptionhorizon in the list payload)
+        unread = bool(int(last.get("id") or 0) > hz and me not in (last.get("from") or "")) if hz else None
+    row = {"id": c["id"], "kind": chat_kind(c), "title": chat_title(c, names, fetch_names),
+           "time": last.get("composetime"), "from": last.get("imdisplayname"), "preview": preview,
+           "last_id": last.get("id"), "unread": unread}
+    if unread_capped is not None:
+        row["unread_capped"] = unread_capped
+    row["read_up_to"] = str(hz) if hz else None
+    if n is not None:
+        row = {"n": n, **row}
+    return row
+
+
 def list_chats():
     """Recent conversations, newest first; also refreshes the cached chat numbers and titles."""
     from concurrent.futures import ThreadPoolExecutor
@@ -388,38 +468,82 @@ def list_chats():
         states = list(ex.map(lambda c: chat_state(c, me), convs))
     rows = []
     for i, (c, (last, unread, capped)) in enumerate(zip(convs, states)):
-        tp = c.get("threadProperties") or {}
-        topic = tp.get("topic") or tp.get("spaceThreadTopic")
-        if c["id"] == "48:notes":
-            title = "Notes (me)"
-        elif topic:
-            title = topic
-        else:
-            nm = peer_name(c["id"], names) if c["id"].endswith("@unq.gbl.spaces") else None
-            title = f"[1:1] {nm}" if nm else "[chat]"
-        text = msg_text(last)
-        preview = f"{last.get('imdisplayname') or '?'}: {text}" if text else f"{last.get('imdisplayname') or '?'}: <{last.get('messagetype', '?')}>"
-        rows.append({"n": i, "id": c["id"], "kind": chat_kind(c), "title": title, "time": last.get("composetime"),
-                     "from": last.get("imdisplayname"), "preview": preview, "last_id": last.get("id"),
-                     "unread": unread, "unread_capped": capped, "read_up_to": str(horizon_of(c)) if horizon_of(c) else None})
-        st.setdefault("titles", {})[c["id"]] = title
+        row = chat_row(c, names, me, last, unread, n=i, unread_capped=capped)
+        rows.append(row)
+        st.setdefault("titles", {})[c["id"]] = row["title"]
     save(st)
     return rows
 
 
+def list_all_chats(refresh=False):
+    """Every conversation (chats, channels of all teams) from the cached full list; `unread` is a boolean."""
+    convs = all_conversations(900, refresh,
+                              progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr))
+    st = load()
+    names = st.get("names") or {}
+    me = my_oid()
+    return [chat_row(c, names, me, fetch_names=False) for c in convs]
+
+
+def channel_tree(convs):
+    """Teams -> channels from the conversation list: [{id, name, channels: [{id, name, kind}]}]."""
+    teams, team_names = {}, {}
+    for c in convs:
+        tp = c.get("threadProperties") or {}
+        gid = tp.get("groupId")
+        if not gid or "@thread.tacv2" not in c.get("id", ""):
+            continue
+        if tp.get("spaceType") == "standard":  # the team's General channel carries the team name
+            kind, name = "general", tp.get("topic") or "General"
+            team_names[gid] = tp.get("spaceThreadTopic") or tp.get("topic") or f"team {gid[:8]}"
+        elif tp.get("spaceId"):
+            kind, name = "channel", tp.get("topic") or tp.get("topicThreadTopic") or c["id"]
+        else:
+            kind, name = "private", tp.get("spaceThreadTopic") or tp.get("topic") or c["id"]
+        teams.setdefault(gid, []).append({"id": c["id"], "name": name, "kind": kind})
+    rows = [{"id": gid, "name": team_names.get(gid) or f"team {gid[:8]}",
+             "channels": sorted(ch, key=lambda x: (x["kind"] != "general", x["name"].casefold()))}
+            for gid, ch in teams.items()]
+    return sorted(rows, key=lambda t: t["name"].casefold())
+
+
+def cmd_teams(a):
+    convs = all_conversations(86400, a.refresh,
+                              progress=lambda n: print(f"  fetched {n} conversations", file=sys.stderr))
+    tree = channel_tree(convs)
+    if a.json:
+        print(json.dumps(tree, ensure_ascii=False, indent=1))
+        return
+    for t in tree:
+        print(t["name"])
+        for ch in t["channels"]:
+            print(f"  {ch['name']}" + ("  (private)" if ch["kind"] == "private" else ""))
+
+
 def cmd_chats(a):
-    rows = list_chats()
+    if a.all:
+        rows = list_all_chats(a.refresh)
+    else:
+        rows = list_chats()
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
     if a.ids:
         for r in rows:
-            print(f"{r['n']:>3}  {r['id']}  {r['title']}")
+            n = f"{r['n']:>3}" if "n" in r else "   "
+            print(f"{n}  {r['id']}  {r['title']}")
         return
     for r in rows:
-        badge = f"({r['unread']}{'+' if r['unread_capped'] else ''})" if r["unread"] else ""
+        unread = r["unread"]
+        if unread is True:
+            badge = "•"
+        elif isinstance(unread, int) and unread:
+            badge = f"({unread}{'+' if r.get('unread_capped') else ''})"
+        else:
+            badge = ""
         prev = r["preview"].replace("\n", " ")
-        print(f"{r['n']:>3}  {ts(r['time']):19}  {r['title'][:36]:36} {badge:>5}  {prev[:60]!r}")
+        n = f"{r['n']:>3}" if "n" in r else "   "
+        print(f"{n}  {ts(r['time']):19}  {r['title'][:36]:36} {badge:>5}  {prev[:60]!r}")
 
 
 def people(cid):
@@ -1062,7 +1186,13 @@ def main():
     c = sub.add_parser("chats")
     c.add_argument("--json", action="store_true")
     c.add_argument("--ids", action="store_true", help="print full chat ids (needed by write commands)")
+    c.add_argument("--all", action="store_true", help="every conversation incl. channels (cached; unread is a dot)")
+    c.add_argument("--refresh", action="store_true", help="with --all: refetch the full conversation list")
     c.set_defaults(fn=cmd_chats)
+    tm = sub.add_parser("teams", help="teams -> channels tree (cached for 24 h)")
+    tm.add_argument("--refresh", action="store_true", help="refetch the conversation list")
+    tm.add_argument("--json", action="store_true")
+    tm.set_defaults(fn=cmd_teams)
     r = sub.add_parser("read")
     r.add_argument("chat")
     r.add_argument("-n", type=int, default=20)
