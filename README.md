@@ -17,12 +17,21 @@ change; using it may be against your organisation's policy.
 
 ```
 teams_cli.py login                          # opens the browser; paste the final blank-page URL back
-teams_cli.py chats [--json]                 # recent conversations, numbered
-teams_cli.py read <n|id-fragment> [-n 20] [--json]
-teams_cli.py watch [chat ...] [--json]      # live incoming messages (Trouter websocket)
-teams_cli.py send <n|id-fragment> "text"    # dry run: only prints what would be sent
-teams_cli.py send <n|id-fragment> "text" --yes   # really sends
+teams_cli.py chats [--json]                 # recent conversations: kind, unread count, preview
+teams_cli.py members <chat> [--json]        # participants (partial for large chats)
+teams_cli.py read <chat> [-n 20] [--before ID] [--json]
+teams_cli.py watch [chat ...] [--json]      # live events (Trouter websocket)
+teams_cli.py download <chat> <id> [-o DIR]  # save image attachments (files: prints the SharePoint url)
+
+# writes: dry run unless --yes
+teams_cli.py send <chat> "text" [--reply-to ID] [--mention NAME ...] [--image PATH] [--json] --yes
+teams_cli.py edit <chat> <id> "new text" --yes
+teams_cli.py delete <chat> <id> --yes
+teams_cli.py react <chat> <id> <like|heart|laugh|...> [--remove] --yes
+teams_cli.py mark-read <chat> [id] --yes    # moves the read marker (default: newest message)
 ```
+
+`--mention NAME` needs `@NAME` in the text; NAME is part of a name of someone who wrote in the chat recently.
 
 Chat numbers come from the last `chats` run. `0` is usually "Notes (me)", the chat with yourself, a safe place to test.
 
@@ -49,7 +58,11 @@ Claude Code) use `login --url '<copied url>'`. The one-time code in that URL exp
 ## Output
 
 Plain text by default; `--json` for scripts (`chats` and `read` print one JSON array, `watch` prints one object per
-line). Errors go to stderr, a failure exits non-zero.
+line). A message is always `id, chat_id, time, from, from_id, type, text, html, attachments, mentions, reactions,
+reply_to, edited, deleted`. In `--json` mode errors are `{"error": "..."}` on stdout with exit code 1.
+
+`watch --json` events (`event` field): `message`, `message_updated`, `message_deleted`, `typing`, `typing_stop`, `read`
+(`chat_id`, `read_up_to`), `system`, `status` (`connected`, `disconnected`, `stalled`, `auth_failed`).
 
 ## Layout
 
@@ -59,4 +72,4 @@ line). Errors go to stderr, a failure exits non-zero.
 
 ## Not done
 
-Attachments and cards are shown as placeholders; replies, reactions, starting new 1:1 chats, marking messages read.
+Non-image files (SharePoint, other auth), cards, starting new 1:1 chats, channel threads, search, presence.
